@@ -1,0 +1,2 @@
+pypresence==4.6.2
+watchdog==6.0.0
