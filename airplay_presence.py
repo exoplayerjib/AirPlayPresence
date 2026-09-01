@@ -6,7 +6,7 @@ window), watches the metadata file and cover art it writes, mirrors
 Track / Artist / Album to Discord through the local IPC socket
 (SET_ACTIVITY) with elapsed / remaining time taken from uxplay's audio
 progress output, exposes the session as an MPRIS media player on D-Bus
-(org.mpris.MediaPlayer2.uxplay; playback control is disabled because the
+(org.mpris.MediaPlayer2.airplaypresence; playback control is disabled because the
 AirPlay client is the only controller), and serves a "now playing" page
 (which also edits which metadata field goes on each of the four Discord
 presence lines) at http://127.0.0.1:<ui-port>, opened in the browser on
@@ -23,7 +23,7 @@ One-time Discord application setup:
 No bot or OAuth configuration is required.
 
 Usage:
-    uxplay_presence.py --client-id <APPLICATION ID>
+    airplay_presence.py --client-id <APPLICATION ID>
 
 Elapsed / remaining times require audio-only (ALAC) AirPlay streaming
 (e.g. Apple Music); screen-mirroring (AAC) provides no progress data.
@@ -42,6 +42,7 @@ import os
 import queue
 import re
 import signal
+import shutil
 import subprocess
 import threading
 import time
@@ -82,7 +83,7 @@ PAUSE_TIMEOUT = 5.0
 RESUME_THROTTLE = 2.0
 MIN_ART_BYTES = 2000
 ART_SETTLE_TIMEOUT = 5.0
-MPRIS_NAME = "org.mpris.MediaPlayer2.uxplay"
+MPRIS_NAME = "org.mpris.MediaPlayer2.airplaypresence"
 MPRIS_PATH = "/org/mpris/MediaPlayer2"
 PROGRESS_RE = re.compile(
     r"audio progress \(min:sec\):\s*(\d+):(\d+);"
@@ -112,7 +113,7 @@ DEFAULT_CONFIG = {
 def valid_source(value) -> bool:
     return value in SOURCE_FIELDS or value in ("none", APPLE_MUSIC)
 
-log = logging.getLogger("uxplay-presence")
+log = logging.getLogger("airplay-presence")
 
 PAGE = """<!doctype html>
 <html lang="en">
@@ -317,7 +318,7 @@ class ImageUploader:
             data=body,
             headers={
                 "Content-Type": f"multipart/form-data; boundary={boundary}",
-                "User-Agent": "uxplay-discord-presence/1.0",
+                "User-Agent": "airplay-presence/1.0",
             },
             method="POST",
         )
@@ -365,7 +366,7 @@ class ArtworkResolver:
         params = urllib.parse.urlencode({"term": term, "entity": "song", "limit": "5"})
         request = urllib.request.Request(
             f"https://itunes.apple.com/search?{params}",
-            headers={"User-Agent": "uxplay-discord-presence/1.0"},
+            headers={"User-Agent": "airplay-presence/1.0"},
         )
         try:
             with urllib.request.urlopen(request, timeout=10) as response:
@@ -539,7 +540,7 @@ class _MprisRoot(ServiceInterface):
 
     @dbus_property(access=PropertyAccess.READ)
     def Identity(self) -> "s":
-        return "uxplay"
+        return "AirPlayPresence"
 
     @dbus_property(access=PropertyAccess.READ)
     def DesktopEntry(self) -> "s":
@@ -1304,7 +1305,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-ui", action="store_true", help="disable the local web UI")
     parser.add_argument("--no-mpris", action="store_true", help="do not expose an MPRIS media player on D-Bus")
     parser.add_argument("--no-browser", action="store_true", help="do not open the web UI in a browser on startup")
-    parser.add_argument("--config", default=None, help="path for the presence-lines config (default ~/.config/uxplay-presence/config.json)")
+    parser.add_argument("--config", default=None, help="path for the presence-lines config (default ~/.config/airplay-presence/config.json)")
     parser.add_argument("--no-uxplay", action="store_true", help="do not spawn uxplay; watch files written by an externally started uxplay")
     parser.add_argument("--debounce", type=float, default=0.5, help="seconds to wait after the last file event")
     parser.add_argument("--min-interval", type=float, default=15.0, help="minimum seconds between regular Discord updates")
@@ -1326,7 +1327,17 @@ def main() -> int:
     meta_path = Path(args.meta_file)
     image_path = Path(args.image_file)
     meta_path.parent.mkdir(parents=True, exist_ok=True)
-    config_path = Path(args.config).expanduser() if args.config else Path.home() / ".config" / "uxplay-presence" / "config.json"
+    config_path = Path(args.config).expanduser() if args.config else Path.home() / ".config" / "airplay-presence" / "config.json"
+    if not args.config and not config_path.exists():
+        legacy = Path.home() / ".config" / "uxplay-presence" / "config.json"
+        if legacy.exists():
+            config_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(legacy), str(config_path))
+            log.info("migrated config from %s", legacy)
+            try:
+                legacy.parent.rmdir()
+            except OSError:
+                pass
 
     progress = ProgressState()
     state = AppState(progress)
