@@ -81,6 +81,8 @@ FIELD_LIMIT = 128
 UPLOAD_URL = "https://catbox.moe/user/api.php"
 PAUSE_TIMEOUT = 5.0
 RESUME_THROTTLE = 2.0
+SEEK_FORWARD_JUMP = 4.0
+SEEK_BACKWARD_JUMP = 2.0
 MIN_ART_BYTES = 2000
 ART_SETTLE_TIMEOUT = 5.0
 MPRIS_NAME = "org.mpris.MediaPlayer2.airplaypresence"
@@ -440,10 +442,18 @@ class ProgressState:
         self._position = 0.0
         self._duration = 0.0
         self._at = 0.0
+        self._last_raw_position: float | None = None
         self.ever = False
+        self.seek_seq = 0
 
     def set(self, position: float, duration: float) -> None:
         with self._lock:
+            if self._last_raw_position is not None and (
+                position > self._last_raw_position + SEEK_FORWARD_JUMP
+                or position < self._last_raw_position - SEEK_BACKWARD_JUMP
+            ):
+                self.seek_seq += 1
+            self._last_raw_position = position
             self._position = position
             self._duration = duration
             self._at = time.monotonic()
@@ -773,7 +783,7 @@ class PresenceBridge:
         self._last_send = 0.0
         self._last_identity: dict | None = None
         self._cleared = True
-        self._queue: "queue.Queue[tuple[str, dict | None, float | None] | None]" = queue.Queue()
+        self._queue: "queue.Queue[tuple[str, dict | None, float | None, bool] | None]" = queue.Queue()
         self._thread: threading.Thread | None = None
         self._failed = threading.Event()
         self._stop_event = threading.Event()
@@ -784,11 +794,11 @@ class PresenceBridge:
         self._thread = threading.Thread(target=self._run, name="discord", daemon=True)
         self._thread.start()
 
-    def update(self, payload: dict, throttle: float | None = None) -> None:
-        self._queue.put(("update", payload, throttle))
+    def update(self, payload: dict, throttle: float | None = None, force: bool = False) -> None:
+        self._queue.put(("update", payload, throttle, force))
 
     def clear(self) -> None:
-        self._queue.put(("clear", None, RESUME_THROTTLE))
+        self._queue.put(("clear", None, RESUME_THROTTLE, False))
 
     def close(self) -> None:
         self._queue.put(None)
@@ -838,11 +848,11 @@ class PresenceBridge:
             return True
         return False
 
-    def _process(self, op: str, payload: dict | None, hint: float | None) -> None:
+    def _process(self, op: str, payload: dict | None, hint: float | None, force: bool) -> None:
         if op == "update":
             identity = {key: payload.get(key) for key in IDENTITY_KEYS}
             identity["has_timer"] = bool(payload.get("start"))
-            if not self._cleared and identity == self._last_identity:
+            if not force and not self._cleared and identity == self._last_identity:
                 log.info("discord: skipped (payload unchanged)")
                 return
             throttle = hint or (RESUME_THROTTLE if self._cleared else self.min_interval)
@@ -1092,7 +1102,7 @@ def run_worker(
     def identity_of(meta: dict) -> tuple[str, str, str]:
         return (meta.get("title") or "", meta.get("artist") or "", meta.get("album") or "")
 
-    def send_update(meta: dict, wait_progress: bool, throttle: float | None = None) -> None:
+    def send_update(meta: dict, wait_progress: bool, throttle: float | None = None, force: bool = False) -> None:
         nonlocal last_identity, last_seen_position, timer_pending, pending_prior, current_meta, current_image
         last_seen_position = None
         identity = identity_of(meta)
@@ -1122,7 +1132,7 @@ def run_worker(
             meta.get("album", "?"),
             f" | {progress_snap[0]:.0f}s of {progress_snap[1]:.0f}s" if progress_snap else "",
         )
-        bridge.update(payload, throttle=throttle)
+        bridge.update(payload, throttle=throttle, force=force)
 
     def clear_presence(paused: bool) -> None:
         nonlocal last_identity, current_meta, current_image
@@ -1141,6 +1151,7 @@ def run_worker(
 
     last_identity: tuple[str, str, str] | None = None
     last_seen_position: float | None = None
+    last_seen_seek = 0
     timer_pending = False
     pending_prior: tuple[float, float] | None = None
     current_meta: dict | None = None
@@ -1204,6 +1215,11 @@ def run_worker(
                 if meta and meta.get("title"):
                     log.info("track progress arrived, refreshing presence timer")
                     send_update(meta, wait_progress=False, throttle=RESUME_THROTTLE)
+        elif progress.seek_seq != last_seen_seek:
+            last_seen_seek = progress.seek_seq
+            if current_meta is not None and meta_path.exists():
+                log.info("track seek detected, updating presence timer")
+                send_update(current_meta, wait_progress=False, throttle=RESUME_THROTTLE, force=True)
     bridge.close()
 
 
