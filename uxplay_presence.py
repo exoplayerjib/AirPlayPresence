@@ -5,9 +5,12 @@ This script starts uxplay itself as an audio-only AirPlay server (no video
 window), watches the metadata file and cover art it writes, mirrors
 Track / Artist / Album to Discord through the local IPC socket
 (SET_ACTIVITY) with elapsed / remaining time taken from uxplay's audio
-progress output, and serves a "now playing" page (which also edits which
-metadata field goes on each of the four Discord presence lines) at
-http://127.0.0.1:<ui-port>, opened in the browser on startup.
+progress output, exposes the session as an MPRIS media player on D-Bus
+(org.mpris.MediaPlayer2.uxplay; playback control is disabled because the
+AirPlay client is the only controller), and serves a "now playing" page
+(which also edits which metadata field goes on each of the four Discord
+presence lines) at http://127.0.0.1:<ui-port>, opened in the browser on
+startup.
 
 Presence is cleared when playback pauses or the stream ends (detected via
 progress-line silence) and restored automatically on resume.
@@ -30,6 +33,7 @@ Pass --no-uxplay to attach to an externally started uxplay instead.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import collections
 import hashlib
 import json
@@ -62,11 +66,24 @@ from pypresence.exceptions import (
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 
+try:
+    from dbus_next import PropertyAccess, RequestNameReply
+    from dbus_next.aio import MessageBus
+    from dbus_next.errors import DBusError
+    from dbus_next.service import ServiceInterface, dbus_property, method
+    from dbus_next.signature import Variant
+    MPRIS_AVAILABLE = True
+except ImportError:
+    MPRIS_AVAILABLE = False
+
 FIELD_LIMIT = 128
 UPLOAD_URL = "https://catbox.moe/user/api.php"
 PAUSE_TIMEOUT = 5.0
 RESUME_THROTTLE = 2.0
-NEW_TRACK_MAX = 10.0
+MIN_ART_BYTES = 2000
+ART_SETTLE_TIMEOUT = 5.0
+MPRIS_NAME = "org.mpris.MediaPlayer2.uxplay"
+MPRIS_PATH = "/org/mpris/MediaPlayer2"
 PROGRESS_RE = re.compile(
     r"audio progress \(min:sec\):\s*(\d+):(\d+);"
     r" remaining:\s*(\d+):(\d+);"
@@ -244,6 +261,24 @@ def parse_metadata(path: Path, retries: int = 3, delay: float = 0.25) -> dict | 
     return None
 
 
+def valid_art_bytes(data: bytes) -> bool:
+    return len(data) >= MIN_ART_BYTES and data[:2] == b"\xff\xd8" and b"\xff\xd9" in data[-4:]
+
+
+def wait_valid_art(path: Path, timeout: float = ART_SETTLE_TIMEOUT) -> bytes | None:
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            data = path.read_bytes()
+        except OSError:
+            data = b""
+        if valid_art_bytes(data):
+            return data
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(0.5)
+
+
 class ImageUploader:
     def __init__(self, enabled: bool):
         self.enabled = enabled
@@ -252,10 +287,9 @@ class ImageUploader:
     def url_for(self, path: Path) -> str | None:
         if not self.enabled:
             return None
-        try:
-            data = path.read_bytes()
-        except OSError as exc:
-            log.warning("cover art unreadable: %s", exc)
+        data = wait_valid_art(path)
+        if data is None:
+            log.info("no valid cover art file to upload")
             return None
         digest = hashlib.sha256(data).hexdigest()
         cached = self._cache.get(digest)
@@ -320,7 +354,8 @@ class ArtworkResolver:
         url = self._lookup_itunes(title, artist)
         if not url:
             url = self.uploader.url_for(image_path)
-        self._cache[key] = url
+        if url:
+            self._cache[key] = url
         return url
 
     def _lookup_itunes(self, title: str, artist: str) -> str | None:
@@ -481,6 +516,253 @@ class AppState:
         }
 
 
+class _MprisRoot(ServiceInterface):
+    def __init__(self, server: "MprisServer") -> None:
+        super().__init__("org.mpris.MediaPlayer2")
+        self._server = server
+
+    @dbus_property(access=PropertyAccess.READ)
+    def CanQuit(self) -> "b":
+        return False
+
+    @dbus_property(access=PropertyAccess.READ)
+    def CanRaise(self) -> "b":
+        return False
+
+    @dbus_property(access=PropertyAccess.READ)
+    def CanSetFullscreen(self) -> "b":
+        return False
+
+    @dbus_property(access=PropertyAccess.READ)
+    def HasTrackList(self) -> "b":
+        return False
+
+    @dbus_property(access=PropertyAccess.READ)
+    def Identity(self) -> "s":
+        return "uxplay"
+
+    @dbus_property(access=PropertyAccess.READ)
+    def DesktopEntry(self) -> "s":
+        return ""
+
+    @dbus_property(access=PropertyAccess.READ)
+    def SupportedUriSchemes(self) -> "as":
+        return []
+
+    @dbus_property(access=PropertyAccess.READ)
+    def SupportedMimeTypes(self) -> "as":
+        return []
+
+
+class _MprisPlayer(ServiceInterface):
+    def __init__(self, server: "MprisServer") -> None:
+        super().__init__("org.mpris.MediaPlayer2.Player")
+        self._server = server
+
+    def _reject(self) -> None:
+        raise DBusError(
+            "org.freedesktop.DBus.Error.NotSupported",
+            "the AirPlay client controls playback, not the server",
+        )
+
+    @dbus_property(access=PropertyAccess.READ)
+    def PlaybackStatus(self) -> "s":
+        return self._server.playback_status()
+
+    @dbus_property(access=PropertyAccess.READ)
+    def LoopStatus(self) -> "s":
+        return "None"
+
+    @dbus_property(access=PropertyAccess.READ)
+    def Rate(self) -> "d":
+        return 1.0
+
+    @dbus_property(access=PropertyAccess.READ)
+    def Shuffle(self) -> "b":
+        return False
+
+    @dbus_property(access=PropertyAccess.READ)
+    def Metadata(self) -> "a{sv}":
+        return self._server.metadata()
+
+    @dbus_property(access=PropertyAccess.READ)
+    def Volume(self) -> "d":
+        return 1.0
+
+    @dbus_property(access=PropertyAccess.READ)
+    def Position(self) -> "x":
+        return self._server.position_us()
+
+    @dbus_property(access=PropertyAccess.READ)
+    def MinimumRate(self) -> "d":
+        return 1.0
+
+    @dbus_property(access=PropertyAccess.READ)
+    def MaximumRate(self) -> "d":
+        return 1.0
+
+    @dbus_property(access=PropertyAccess.READ)
+    def CanGoNext(self) -> "b":
+        return False
+
+    @dbus_property(access=PropertyAccess.READ)
+    def CanGoPrevious(self) -> "b":
+        return False
+
+    @dbus_property(access=PropertyAccess.READ)
+    def CanPlay(self) -> "b":
+        return False
+
+    @dbus_property(access=PropertyAccess.READ)
+    def CanPause(self) -> "b":
+        return False
+
+    @dbus_property(access=PropertyAccess.READ)
+    def CanSeek(self) -> "b":
+        return False
+
+    @dbus_property(access=PropertyAccess.READ)
+    def CanControl(self) -> "b":
+        return False
+
+    @method()
+    def Play(self):
+        self._reject()
+
+    @method()
+    def Pause(self):
+        self._reject()
+
+    @method()
+    def PlayPause(self):
+        self._reject()
+
+    @method()
+    def Stop(self):
+        self._reject()
+
+    @method()
+    def Next(self):
+        self._reject()
+
+    @method()
+    def Previous(self):
+        self._reject()
+
+    @method()
+    def Seek(self, offset: "x"):
+        self._reject()
+
+    @method()
+    def SetPosition(self, track_id: "o", position: "x"):
+        self._reject()
+
+    @method()
+    def OpenUri(self, uri: "s"):
+        self._reject()
+
+
+class MprisServer:
+    def __init__(self, ui_port: int | None, image_path: Path, progress: ProgressState) -> None:
+        self._ui_port = ui_port
+        self._image_path = image_path
+        self._progress = progress
+        self._meta: dict | None = None
+        self._image: str | None = None
+        self._paused = False
+        self._connected = False
+        self._bus = None
+        self._root = _MprisRoot(self)
+        self._player = _MprisPlayer(self)
+        self._loop = asyncio.new_event_loop()
+        self._thread = threading.Thread(target=self._loop.run_forever, name="mpris", daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+        future = asyncio.run_coroutine_threadsafe(self._connect(), self._loop)
+        try:
+            self._connected = bool(future.result(timeout=15))
+        except Exception as exc:
+            log.warning("MPRIS setup failed: %s", exc)
+        if self._connected:
+            log.info("MPRIS player on the session bus: %s", MPRIS_NAME)
+        else:
+            log.warning("MPRIS disabled (session bus unavailable)")
+
+    async def _connect(self) -> bool:
+        try:
+            bus = MessageBus()
+            await bus.connect()
+            bus.export(MPRIS_PATH, self._root)
+            bus.export(MPRIS_PATH, self._player)
+            reply = await bus.request_name(MPRIS_NAME)
+            if reply not in (RequestNameReply.PRIMARY_OWNER, RequestNameReply.ALREADY_OWNER):
+                log.warning("MPRIS name %s not acquired (%s)", MPRIS_NAME, reply)
+                return False
+            self._bus = bus
+            return True
+        except Exception as exc:
+            log.warning("MPRIS unavailable: %s", exc)
+            return False
+
+    def publish(self, meta: dict | None, image_url: str | None, paused: bool) -> None:
+        if not self._connected:
+            return
+        self._meta = dict(meta) if meta else None
+        self._image = image_url
+        self._paused = paused
+        asyncio.run_coroutine_threadsafe(self._push(), self._loop)
+
+    async def _push(self) -> None:
+        try:
+            self._player.emit_properties_changed(
+                {"Metadata": self.metadata(), "PlaybackStatus": self.playback_status()}
+            )
+        except Exception as exc:
+            log.debug("mpris: push failed: %s", exc)
+
+    def playback_status(self) -> str:
+        if self._meta is None:
+            return "Stopped"
+        return "Paused" if self._paused else "Playing"
+
+    def position_us(self) -> int:
+        snap = self._progress.snapshot()
+        return int(snap[0] * 1_000_000) if snap else 0
+
+    def _art_url(self) -> str | None:
+        if self._image:
+            return self._image
+        if self._ui_port is not None:
+            return f"http://127.0.0.1:{self._ui_port}/art"
+        return "file://" + str(self._image_path.resolve())
+
+    def metadata(self) -> dict:
+        meta = self._meta
+        if not meta:
+            return {}
+        fields: dict = {}
+        for key, slot in (("title", "xesam:title"), ("album", "xesam:album")):
+            value = clip(meta.get(key))
+            if value:
+                fields[slot] = Variant("s", value)
+        for key, slot in (
+            ("artist", "xesam:artist"),
+            ("album artist", "xesam:albumArtist"),
+            ("genre", "xesam:genre"),
+        ):
+            value = clip(meta.get(key))
+            if value:
+                fields[slot] = Variant("as", [value])
+        art = self._art_url()
+        if art:
+            fields["mpris:artUrl"] = Variant("s", art)
+        snap = self._progress.snapshot()
+        if snap:
+            fields["mpris:length"] = Variant("x", int(snap[1] * 1_000_000))
+        return fields
+
+
 class PresenceBridge:
     def __init__(self, client_id: str, min_interval: float, dry_run: bool):
         self.client_id = client_id
@@ -490,13 +772,49 @@ class PresenceBridge:
         self._last_send = 0.0
         self._last_identity: dict | None = None
         self._cleared = True
+        self._queue: "queue.Queue[tuple[str, dict | None, float | None] | None]" = queue.Queue()
+        self._thread: threading.Thread | None = None
+        self._failed = threading.Event()
+        self._stop_event = threading.Event()
 
-    def connect(self) -> bool:
+    def start(self, failed: threading.Event, stop_event: threading.Event) -> None:
+        self._failed = failed
+        self._stop_event = stop_event
+        self._thread = threading.Thread(target=self._run, name="discord", daemon=True)
+        self._thread.start()
+
+    def update(self, payload: dict, throttle: float | None = None) -> None:
+        self._queue.put(("update", payload, throttle))
+
+    def clear(self) -> None:
+        self._queue.put(("clear", None, RESUME_THROTTLE))
+
+    def close(self) -> None:
+        self._queue.put(None)
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+
+    def _run(self) -> None:
+        if not self._connect():
+            self._failed.set()
+            self._stop_event.set()
+            return
+        while not self._stop_event.is_set():
+            try:
+                item = self._queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            if item is None:
+                break
+            self._process(*item)
+        self._disconnect()
+
+    def _connect(self) -> bool:
         if self.dry_run:
             log.info("dry run: skipping Discord connection")
             return True
         backoff = 5.0
-        while True:
+        while not self._stop_event.is_set():
             try:
                 rpc = Presence(self.client_id)
                 rpc.connect()
@@ -509,52 +827,50 @@ class PresenceBridge:
                 return False
             except PyPresenceException as exc:
                 log.warning("Discord not reachable (%s), retrying in %.0fs", exc, backoff)
-                time.sleep(backoff)
+                if self._stop_event.wait(backoff):
+                    return False
                 backoff = min(backoff * 2, 60)
                 continue
             self._rpc = rpc
             self._last_send = 0.0
             log.info("connected to Discord IPC")
             return True
+        return False
 
-    def update(self, payload: dict, throttle: float | None = None) -> None:
-        identity = {key: payload.get(key) for key in IDENTITY_KEYS}
-        identity["has_timer"] = bool(payload.get("start"))
-        if not self._cleared and identity == self._last_identity:
-            log.debug("payload unchanged, skipping")
-            return
-        was_cleared = self._cleared
-        if self._send("update", payload, throttle if throttle else (RESUME_THROTTLE if was_cleared else self.min_interval)):
-            self._last_identity = identity
-            self._cleared = False
-
-    def clear(self) -> None:
-        if self._cleared:
-            return
-        if self._send("clear", None, RESUME_THROTTLE):
-            self._last_identity = None
-            self._cleared = True
-
-    def close(self) -> None:
-        if self._rpc is not None:
-            try:
-                self._rpc.close()
-            except Exception:
-                pass
-            self._rpc = None
+    def _process(self, op: str, payload: dict | None, hint: float | None) -> None:
+        if op == "update":
+            identity = {key: payload.get(key) for key in IDENTITY_KEYS}
+            identity["has_timer"] = bool(payload.get("start"))
+            if not self._cleared and identity == self._last_identity:
+                log.info("discord: skipped (payload unchanged)")
+                return
+            throttle = hint or (RESUME_THROTTLE if self._cleared else self.min_interval)
+            if self._send("update", payload, throttle):
+                self._last_identity = identity
+                self._cleared = False
+                log.info("discord: presence updated")
+        else:
+            if self._cleared:
+                return
+            if self._send("clear", None, RESUME_THROTTLE):
+                self._last_identity = None
+                self._cleared = True
+                log.info("discord: presence cleared")
 
     def _throttle(self, min_wait: float) -> None:
         wait = self._last_send + min_wait - time.monotonic()
+        if wait > 0.5:
+            log.info("discord: rate limit, sending in %.0fs", wait)
         if wait > 0:
             time.sleep(wait)
 
     def _send(self, op: str, payload: dict | None, throttle: float) -> bool:
-        if self.dry_run:
-            log.info("dry-run %s: %s", op, payload)
-            self._last_send = time.monotonic()
-            return True
         for _ in range(4):
             self._throttle(throttle)
+            if self.dry_run:
+                log.info("dry-run %s: %s", op, payload)
+                self._last_send = time.monotonic()
+                return True
             try:
                 if op == "update":
                     self._rpc.update(**payload)
@@ -580,22 +896,31 @@ class PresenceBridge:
         return False
 
     def _reconnect(self) -> None:
-        self.close()
+        self._disconnect()
         self._last_identity = None
         self._cleared = True
         backoff = 2.0
-        while True:
+        while not self._stop_event.is_set():
             try:
                 rpc = Presence(self.client_id)
                 rpc.connect()
             except PyPresenceException as exc:
                 log.warning("reconnect failed (%s), retrying in %.0fs", exc, backoff)
-                time.sleep(backoff)
+                if self._stop_event.wait(backoff):
+                    return
                 backoff = min(backoff * 2, 60)
                 continue
             self._rpc = rpc
             log.info("reconnected to Discord IPC")
             return
+
+    def _disconnect(self) -> None:
+        if self._rpc is not None:
+            try:
+                self._rpc.close()
+            except Exception:
+                pass
+            self._rpc = None
 
 
 class Debouncer:
@@ -711,20 +1036,22 @@ def read_uxplay_output(
             break
         text = line.rstrip()
         tail.append(text)
-        log.debug("uxplay: %s", text)
         match = PROGRESS_RE.search(text)
         if match:
             position = int(match.group(1)) * 60 + int(match.group(2))
             remaining = int(match.group(3)) * 60 + int(match.group(4))
             duration = int(match.group(5)) * 60 + int(match.group(6))
             progress.set(float(position), float(duration))
+            log.info("uxplay: %s", text)
+        else:
+            log.debug("uxplay: %s", text)
     dead.set()
 
 
 def new_track_signature(snap: tuple[float, float], prior: tuple[float, float] | None) -> bool:
     if prior is None:
         return True
-    return snap[0] <= NEW_TRACK_MAX or snap[1] != prior[1]
+    return snap[1] != prior[1] or snap[0] <= prior[0]
 
 
 def wait_for_progress(
@@ -756,21 +1083,16 @@ def run_worker(
     config: PresenceConfig,
     jobs: "queue.Queue[str]",
     stop_event: threading.Event,
-    failed: threading.Event,
     state: AppState,
     progress: ProgressState,
     misses: list[int],
+    mpris: "MprisServer | None",
 ) -> None:
-    if not bridge.connect():
-        failed.set()
-        stop_event.set()
-        return
-
     def identity_of(meta: dict) -> tuple[str, str, str]:
         return (meta.get("title") or "", meta.get("artist") or "", meta.get("album") or "")
 
     def send_update(meta: dict, wait_progress: bool, throttle: float | None = None) -> None:
-        nonlocal last_identity, last_seen_position, timer_pending, pending_prior
+        nonlocal last_identity, last_seen_position, timer_pending, pending_prior, current_meta, current_image
         last_seen_position = None
         identity = identity_of(meta)
         changed = identity != last_identity
@@ -787,6 +1109,10 @@ def run_worker(
             pending_prior = None
         image_url = artwork.url_for(meta, image_path)
         state.set_now_playing(meta, image_url)
+        current_meta = meta
+        current_image = image_url
+        if mpris is not None:
+            mpris.publish(meta, image_url, paused=False)
         payload = build_payload(meta, image_url, progress_snap, config.get())
         log.info(
             "now playing: %s | %s | %s%s",
@@ -798,18 +1124,26 @@ def run_worker(
         bridge.update(payload, throttle=throttle)
 
     def clear_presence(paused: bool) -> None:
-        nonlocal last_identity
+        nonlocal last_identity, current_meta, current_image
         bridge.clear()
         if paused:
             state.set_paused()
+            if mpris is not None:
+                mpris.publish(current_meta, current_image, paused=True)
         else:
             state.set_idle()
+            current_meta = None
+            current_image = None
+            if mpris is not None:
+                mpris.publish(None, None, paused=False)
         last_identity = None
 
     last_identity: tuple[str, str, str] | None = None
     last_seen_position: float | None = None
     timer_pending = False
     pending_prior: tuple[float, float] | None = None
+    current_meta: dict | None = None
+    current_image: str | None = None
     active = False
     while not stop_event.is_set():
         try:
@@ -904,6 +1238,8 @@ def make_ui_server(
                 try:
                     data = image_path.read_bytes()
                 except OSError:
+                    data = b""
+                if not valid_art_bytes(data):
                     self.send_error(404)
                     return
                 self._send(200, "image/jpeg", data)
@@ -966,6 +1302,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--name", default=None, help="AirPlay server name shown on clients")
     parser.add_argument("--ui-port", type=int, default=8080, help="port for the local web UI (default 8080)")
     parser.add_argument("--no-ui", action="store_true", help="disable the local web UI")
+    parser.add_argument("--no-mpris", action="store_true", help="do not expose an MPRIS media player on D-Bus")
     parser.add_argument("--no-browser", action="store_true", help="do not open the web UI in a browser on startup")
     parser.add_argument("--config", default=None, help="path for the presence-lines config (default ~/.config/uxplay-presence/config.json)")
     parser.add_argument("--no-uxplay", action="store_true", help="do not spawn uxplay; watch files written by an externally started uxplay")
@@ -1007,6 +1344,14 @@ def main() -> int:
     if not args.no_ui:
         ui_server = make_ui_server(args.ui_port, state, image_path, config, lambda: jobs.put("refresh"))
 
+    mpris = None
+    if not args.no_mpris:
+        if not MPRIS_AVAILABLE:
+            log.warning("MPRIS disabled (dbus-next is not installed)")
+        else:
+            mpris = MprisServer(None if args.no_ui else args.ui_port, image_path, progress)
+            mpris.start()
+
     proc: subprocess.Popen | None = None
     tail: collections.deque = collections.deque(maxlen=15)
     uxplay_dead = threading.Event()
@@ -1025,9 +1370,10 @@ def main() -> int:
             url = f"http://127.0.0.1:{args.ui_port}"
             threading.Thread(target=webbrowser.open, args=(url,), daemon=True).start()
 
+    bridge.start(failed, stop_event)
     worker = threading.Thread(
         target=run_worker,
-        args=(meta_path, image_path, bridge, artwork, config, jobs, stop_event, failed, state, progress, misses),
+        args=(meta_path, image_path, bridge, artwork, config, jobs, stop_event, state, progress, misses, mpris),
         daemon=True,
     )
     worker.start()
