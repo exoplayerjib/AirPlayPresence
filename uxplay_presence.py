@@ -66,6 +66,7 @@ FIELD_LIMIT = 128
 UPLOAD_URL = "https://catbox.moe/user/api.php"
 PAUSE_TIMEOUT = 5.0
 RESUME_THROTTLE = 2.0
+NEW_TRACK_MAX = 10.0
 PROGRESS_RE = re.compile(
     r"audio progress \(min:sec\):\s*(\d+):(\d+);"
     r" remaining:\s*(\d+):(\d+);"
@@ -416,13 +417,22 @@ class ProgressState:
         with self._lock:
             return self.ever and (time.monotonic() - self._at) > timeout
 
-    def snapshot(self, max_age: float | None = None) -> tuple[float, float] | None:
+    def snapshot(
+        self,
+        max_age: float | None = None,
+        min_at: float | None = None,
+        raw: bool = False,
+    ) -> tuple[float, float] | None:
         with self._lock:
             if self._duration <= 0:
                 return None
             age = time.monotonic() - self._at
             if max_age is not None and age > max_age:
                 return None
+            if min_at is not None and self._at < min_at:
+                return None
+            if raw:
+                return self._position, self._duration
             position = min(self._position + max(0.0, min(age, 3.0)), self._duration)
             return position, self._duration
 
@@ -509,6 +519,7 @@ class PresenceBridge:
 
     def update(self, payload: dict, throttle: float | None = None) -> None:
         identity = {key: payload.get(key) for key in IDENTITY_KEYS}
+        identity["has_timer"] = bool(payload.get("start"))
         if not self._cleared and identity == self._last_identity:
             log.debug("payload unchanged, skipping")
             return
@@ -710,22 +721,31 @@ def read_uxplay_output(
     dead.set()
 
 
+def new_track_signature(snap: tuple[float, float], prior: tuple[float, float] | None) -> bool:
+    if prior is None:
+        return True
+    return snap[0] <= NEW_TRACK_MAX or snap[1] != prior[1]
+
+
 def wait_for_progress(
-    progress: ProgressState, changed: bool, misses: list[int]
+    progress: ProgressState,
+    changed_at: float | None,
+    prior: tuple[float, float] | None,
+    misses: list[int],
 ) -> tuple[float, float] | None:
-    if not changed:
+    if changed_at is None:
         return progress.snapshot()
     deadline = time.monotonic() + 3.0
-    snap = None
-    while snap is None and time.monotonic() < deadline:
-        snap = progress.snapshot(max_age=8.0)
-        if snap is None:
-            time.sleep(0.2)
-    if snap is None and not progress.ever:
+    while time.monotonic() < deadline:
+        cur = progress.snapshot(min_at=changed_at, raw=True)
+        if cur is not None and new_track_signature(cur, prior):
+            return progress.snapshot(min_at=changed_at)
+        time.sleep(0.2)
+    if prior is None:
         misses[0] += 1
         if misses[0] >= 3:
             log.info("no playback progress available, not waiting for it anymore")
-    return snap
+    return None
 
 
 def run_worker(
@@ -750,11 +770,21 @@ def run_worker(
         return (meta.get("title") or "", meta.get("artist") or "", meta.get("album") or "")
 
     def send_update(meta: dict, wait_progress: bool, throttle: float | None = None) -> None:
-        nonlocal last_identity
+        nonlocal last_identity, last_seen_position, timer_pending, pending_prior
+        last_seen_position = None
         identity = identity_of(meta)
         changed = identity != last_identity
         last_identity = identity
-        progress_snap = wait_for_progress(progress, changed, misses) if wait_progress else progress.snapshot()
+        if wait_progress:
+            prior = progress.snapshot(raw=True)
+            changed_at = time.monotonic() if changed else None
+            progress_snap = wait_for_progress(progress, changed_at, prior, misses)
+            timer_pending = progress_snap is None
+            pending_prior = prior if timer_pending else None
+        else:
+            progress_snap = progress.snapshot()
+            timer_pending = progress_snap is None
+            pending_prior = None
         image_url = artwork.url_for(meta, image_path)
         state.set_now_playing(meta, image_url)
         payload = build_payload(meta, image_url, progress_snap, config.get())
@@ -777,6 +807,9 @@ def run_worker(
         last_identity = None
 
     last_identity: tuple[str, str, str] | None = None
+    last_seen_position: float | None = None
+    timer_pending = False
+    pending_prior: tuple[float, float] | None = None
     active = False
     while not stop_event.is_set():
         try:
@@ -812,13 +845,30 @@ def run_worker(
             log.info("playback paused or stream ended, clearing presence")
             clear_presence(paused=True)
             active = False
-        elif not active and progress.snapshot(max_age=PAUSE_TIMEOUT) is not None:
-            if meta_path.exists():
+        elif not active:
+            snap = progress.snapshot(max_age=PAUSE_TIMEOUT, raw=True)
+            if snap is not None:
+                if last_seen_position is not None and abs(snap[0] - last_seen_position) >= 0.5:
+                    if meta_path.exists():
+                        meta = parse_metadata(meta_path)
+                        if meta and meta.get("title"):
+                            log.info("playback resumed, restoring presence")
+                            send_update(meta, wait_progress=False, throttle=RESUME_THROTTLE)
+                            active = True
+                else:
+                    last_seen_position = snap[0]
+        elif timer_pending:
+            snap = progress.snapshot(max_age=PAUSE_TIMEOUT, raw=True)
+            if (
+                snap is not None
+                and snap != pending_prior
+                and new_track_signature(snap, pending_prior)
+                and meta_path.exists()
+            ):
                 meta = parse_metadata(meta_path)
                 if meta and meta.get("title"):
-                    log.info("playback resumed, restoring presence")
+                    log.info("track progress arrived, refreshing presence timer")
                     send_update(meta, wait_progress=False, throttle=RESUME_THROTTLE)
-                    active = True
     bridge.close()
 
 
