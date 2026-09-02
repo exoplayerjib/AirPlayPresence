@@ -856,14 +856,50 @@ class PresenceBridge:
                 log.info("discord: skipped (payload unchanged)")
                 return
             throttle = hint or (RESUME_THROTTLE if self._cleared else self.min_interval)
-            if self._send("update", payload, throttle):
+            self._throttle(throttle)
+        else:
+            if self._cleared:
+                return
+            self._throttle(RESUME_THROTTLE)
+        for op, payload, hint, force in self._absorb(op, payload, hint, force):
+            self._dispatch(op, payload, force)
+
+    def _absorb(self, op: str, payload: dict | None, hint: float | None, force: bool) -> "list[tuple[str, dict | None, float | None, bool]]":
+        items: "list[tuple[str, dict | None, float | None, bool]]" = [(op, payload, hint, force)]
+        while True:
+            try:
+                nxt = self._queue.get_nowait()
+            except queue.Empty:
+                break
+            if nxt is None:
+                self._queue.put(nxt)
+                break
+            items.append(nxt)
+        out: "list[tuple[str, dict | None, float | None, bool]]" = []
+        for it in items:
+            if out and out[-1][0] == "update" and it[0] in ("update", "clear"):
+                out[-1] = it
+            else:
+                out.append(it)
+        if len(out) < len(items):
+            log.info("discord: coalesced %d queued updates", len(items) - len(out))
+        return out
+
+    def _dispatch(self, op: str, payload: dict | None, force: bool) -> None:
+        if op == "update":
+            identity = {key: payload.get(key) for key in IDENTITY_KEYS}
+            identity["has_timer"] = bool(payload.get("start"))
+            if not force and not self._cleared and identity == self._last_identity:
+                log.info("discord: skipped (payload unchanged)")
+                return
+            if self._send("update", payload):
                 self._last_identity = identity
                 self._cleared = False
                 log.info("discord: presence updated")
         else:
             if self._cleared:
                 return
-            if self._send("clear", None, RESUME_THROTTLE):
+            if self._send("clear", None):
                 self._last_identity = None
                 self._cleared = True
                 log.info("discord: presence cleared")
@@ -875,9 +911,8 @@ class PresenceBridge:
         if wait > 0:
             time.sleep(wait)
 
-    def _send(self, op: str, payload: dict | None, throttle: float) -> bool:
+    def _send(self, op: str, payload: dict | None) -> bool:
         for _ in range(4):
-            self._throttle(throttle)
             if self.dry_run:
                 log.info("dry-run %s: %s", op, payload)
                 self._last_send = time.monotonic()
