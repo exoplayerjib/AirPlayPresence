@@ -105,7 +105,7 @@ Useful without Discord too: `--dry-run` runs everything except the Discord conne
 
 The page that opens on launch (`http://127.0.0.1:8080`) has a **"Discord presence lines"** panel:
 
-- **First line / Second line / Third line / Fourth line** — what goes on each Discord presence line: Title, Artist, Album, Album artist, Genre, a fixed "Apple Music" text, or nothing.
+- **First line / Second line / Third line / Fourth line** — what goes on each Discord presence line: Title, Artist, Album, Album artist, Genre, a fixed "Apple Music" text, your own custom text, or nothing.
 - **Member list shows** — which line Discord uses next to your username.
 
 Changes apply live and are saved to `~/.config/airplay-presence/config.json`.
@@ -123,8 +123,8 @@ Changes apply live and are saved to `~/.config/airplay-presence/config.json`.
 | `--no-image` | — | Disable cover-art lookup/upload |
 | `--meta-file` / `--image-file` | `/tmp/uxplay/…` | uxplay output file paths |
 | `--config PATH` | `~/.config/airplay-presence/config.json` | Presence-lines config |
-| `--min-interval S` | 15 | Minimum seconds between Discord updates |
-| `--debounce S` | 0.5 | Metadata file event debounce |
+| `--min-interval S` | 5 | Minimum seconds between Discord updates; the presence is also re-sent at this cadence even when unchanged |
+| `--debounce S` | 1.5 | Metadata file event debounce; rapid track changes within this window collapse into one update |
 | `--dry-run` | — | Log payloads instead of talking to Discord |
 | `--verbose` | — | Debug logging (includes all uxplay output) |
 | `--no-uxplay` | — | Attach to an already-running uxplay instead of spawning one |

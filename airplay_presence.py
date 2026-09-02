@@ -83,6 +83,8 @@ PAUSE_TIMEOUT = 5.0
 RESUME_THROTTLE = 2.0
 SEEK_FORWARD_JUMP = 4.0
 SEEK_BACKWARD_JUMP = 2.0
+SEEK_BASE_MAX_AGE = 8.0
+HEARTBEAT_QUIET = 5.0
 MIN_ART_BYTES = 2000
 ART_SETTLE_TIMEOUT = 5.0
 MPRIS_NAME = "org.mpris.MediaPlayer2.airplaypresence"
@@ -97,6 +99,7 @@ SLOTS = ("name", "details", "state", "large_text")
 SOURCE_FIELDS = ("title", "artist", "album", "album artist", "genre")
 APPLE_MUSIC = "apple music"
 APPLE_MUSIC_TEXT = "Apple Music"
+CUSTOM_PREFIX = "custom:"
 STATUS_DISPLAY_OPTIONS = ("name", "details", "state")
 STATUS_DISPLAY_MAP = {
     "name": StatusDisplayType.NAME,
@@ -113,7 +116,9 @@ DEFAULT_CONFIG = {
 
 
 def valid_source(value) -> bool:
-    return value in SOURCE_FIELDS or value in ("none", APPLE_MUSIC)
+    if value in SOURCE_FIELDS or value in ("none", APPLE_MUSIC):
+        return True
+    return isinstance(value, str) and value.startswith(CUSTOM_PREFIX) and bool(value[len(CUSTOM_PREFIX):].strip())
 
 log = logging.getLogger("airplay-presence")
 
@@ -141,6 +146,7 @@ h1{font-size:1.3rem;margin:18px 0 4px;overflow-wrap:anywhere}
 .settings summary{cursor:pointer;padding:12px 16px;color:#a3aabb;user-select:none}
 .settings .row{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:6px 16px}
 .settings select{background:#262b36;color:#e8eaf0;border:1px solid #33384a;border-radius:6px;padding:4px 8px;font-size:.85rem}
+.settings input{background:#262b36;color:#e8eaf0;border:1px solid #33384a;border-radius:6px;padding:4px 8px;font-size:.85rem;width:118px}
 </style>
 </head>
 <body>
@@ -167,7 +173,7 @@ h1{font-size:1.3rem;margin:18px 0 4px;overflow-wrap:anywhere}
 <script>
 const el = id => document.getElementById(id);
 const fmt = t => { t = Math.max(0, Math.floor(t)); return Math.floor(t/60) + ":" + String(t%60).padStart(2,"0"); };
-const FIELDS = [["title","Title"],["artist","Artist"],["album","Album"],["album artist","Album artist"],["genre","Genre"],["apple music","Apple Music (fixed)"],["none","(nothing)"]];
+const FIELDS = [["title","Title"],["artist","Artist"],["album","Album"],["album artist","Album artist"],["genre","Genre"],["apple music","Apple Music (fixed)"],["custom","Custom text…"],["none","(nothing)"]];
 const SLOTS = [["name","sel-name"],["details","sel-details"],["state","sel-state"],["large_text","sel-large_text"]];
 const DISPLAYS = [["name","First line (Apple Music)"],["details","Second line"],["state","Third line"]];
 let cfg = null;
@@ -179,6 +185,8 @@ async function postConfig(next, fallback) {
     return true;
   } catch (e) { return false; }
 }
+const CUSTOM = "custom";
+const inputs = {};
 for (const [slot, sel] of SLOTS) {
   const s = el(sel);
   for (const [value, label] of FIELDS) {
@@ -186,8 +194,24 @@ for (const [slot, sel] of SLOTS) {
     o.value = value; o.textContent = label;
     s.appendChild(o);
   }
+  const inp = document.createElement("input");
+  inp.type = "text"; inp.placeholder = "Custom text"; inp.style.display = "none";
+  s.parentElement.appendChild(inp);
+  inputs[slot] = inp;
+  const revert = () => {
+    const v = cfg && cfg[slot] ? cfg[slot] : "title";
+    if (v.startsWith("custom:")) { s.value = CUSTOM; inp.value = v.slice(7); inp.style.display = ""; }
+    else { s.value = v; inp.style.display = "none"; }
+  };
   s.addEventListener("change", async () => {
-    if (!await postConfig({ ...cfg, [slot]: s.value })) s.value = cfg ? cfg[slot] : "title";
+    if (s.value === CUSTOM) { inp.style.display = ""; inp.focus(); return; }
+    inp.style.display = "none";
+    if (!await postConfig({ ...cfg, [slot]: s.value })) revert();
+  });
+  inp.addEventListener("change", async () => {
+    const text = inp.value.trim();
+    if (!text) { revert(); return; }
+    if (!await postConfig({ ...cfg, [slot]: "custom:" + text })) revert();
   });
 }
 const selD = el("sel-status_display");
@@ -201,7 +225,11 @@ selD.addEventListener("change", async () => {
 });
 (async () => {
   try { cfg = await (await fetch("/config")).json(); } catch (e) { return; }
-  for (const [slot, sel] of SLOTS) el(sel).value = cfg[slot] || "title";
+  for (const [slot, sel] of SLOTS) {
+    const v = cfg[slot] || "title";
+    if (v.startsWith("custom:")) { el(sel).value = CUSTOM; inputs[slot].value = v.slice(7); inputs[slot].style.display = ""; }
+    else el(sel).value = v;
+  }
   selD.value = cfg.status_display || "state";
 })();
 async function tick() {
@@ -443,6 +471,8 @@ class ProgressState:
         self._duration = 0.0
         self._at = 0.0
         self._last_raw_position: float | None = None
+        self._seek_base: tuple[float, float] | None = None
+        self._seek_base_at = 0.0
         self.ever = False
         self.seek_seq = 0
 
@@ -453,11 +483,19 @@ class ProgressState:
                 or position < self._last_raw_position - SEEK_BACKWARD_JUMP
             ):
                 self.seek_seq += 1
+                self._seek_base = (self._position, self._duration)
+                self._seek_base_at = time.monotonic()
             self._last_raw_position = position
             self._position = position
             self._duration = duration
             self._at = time.monotonic()
             self.ever = True
+
+    def seek_base(self, max_age: float) -> tuple[float, float] | None:
+        with self._lock:
+            if self._seek_base is None or (time.monotonic() - self._seek_base_at) > max_age:
+                return None
+            return self._seek_base
 
     def stale(self, timeout: float) -> bool:
         with self._lock:
@@ -904,6 +942,9 @@ class PresenceBridge:
                 self._cleared = True
                 log.info("discord: presence cleared")
 
+    def idle_for(self) -> float:
+        return time.monotonic() - self._last_send
+
     def _throttle(self, min_wait: float) -> None:
         wait = self._last_send + min_wait - time.monotonic()
         if wait > 0.5:
@@ -973,11 +1014,13 @@ class Debouncer:
     def __init__(self, delay: float, submit):
         self.delay = delay
         self.submit = submit
+        self.last_schedule = 0.0
         self._timer: threading.Timer | None = None
         self._lock = threading.Lock()
 
     def schedule(self, job: str) -> None:
         with self._lock:
+            self.last_schedule = time.monotonic()
             if self._timer is not None:
                 self._timer.cancel()
             self._timer = threading.Timer(self.delay, self.submit, args=(job,))
@@ -1031,7 +1074,12 @@ def build_payload(
         field = mapping.get(slot)
         if not field or field == "none":
             continue
-        value = clip(APPLE_MUSIC_TEXT) if field == APPLE_MUSIC else clip(meta.get(field))
+        if field == APPLE_MUSIC:
+            value = clip(APPLE_MUSIC_TEXT)
+        elif field.startswith(CUSTOM_PREFIX):
+            value = clip(clean_value(field[len(CUSTOM_PREFIX):]))
+        else:
+            value = clip(meta.get(field))
         if value:
             payload[slot] = value
     if image_url:
@@ -1133,18 +1181,19 @@ def run_worker(
     progress: ProgressState,
     misses: list[int],
     mpris: "MprisServer | None",
+    debouncer: Debouncer,
 ) -> None:
     def identity_of(meta: dict) -> tuple[str, str, str]:
         return (meta.get("title") or "", meta.get("artist") or "", meta.get("album") or "")
 
     def send_update(meta: dict, wait_progress: bool, throttle: float | None = None, force: bool = False) -> None:
-        nonlocal last_identity, last_seen_position, timer_pending, pending_prior, current_meta, current_image
+        nonlocal last_identity, last_seen_position, timer_pending, pending_prior, current_meta, current_image, last_payload
         last_seen_position = None
         identity = identity_of(meta)
         changed = identity != last_identity
         last_identity = identity
         if wait_progress:
-            prior = progress.snapshot(raw=True)
+            prior = progress.seek_base(SEEK_BASE_MAX_AGE) or progress.snapshot(raw=True)
             changed_at = time.monotonic() if changed else None
             progress_snap = wait_for_progress(progress, changed_at, prior, misses)
             timer_pending = progress_snap is None
@@ -1168,6 +1217,7 @@ def run_worker(
             f" | {progress_snap[0]:.0f}s of {progress_snap[1]:.0f}s" if progress_snap else "",
         )
         bridge.update(payload, throttle=throttle, force=force)
+        last_payload = payload
 
     def clear_presence(paused: bool) -> None:
         nonlocal last_identity, current_meta, current_image
@@ -1192,6 +1242,8 @@ def run_worker(
     current_meta: dict | None = None
     current_image: str | None = None
     active = False
+    last_payload: dict | None = None
+    last_job_at = 0.0
     while not stop_event.is_set():
         try:
             job = jobs.get(timeout=0.5)
@@ -1209,6 +1261,7 @@ def run_worker(
             active = False
             continue
         if job in ("update", "refresh"):
+            last_job_at = time.monotonic()
             if not meta_path.exists():
                 continue
             meta = parse_metadata(meta_path)
@@ -1220,6 +1273,7 @@ def run_worker(
                 active = False
                 continue
             send_update(meta, wait_progress=(job == "update"), throttle=(RESUME_THROTTLE if job == "refresh" else None))
+            last_seen_seek = progress.seek_seq
             active = True
             continue
         if active and progress.stale(PAUSE_TIMEOUT):
@@ -1238,6 +1292,17 @@ def run_worker(
                             active = True
                 else:
                     last_seen_position = snap[0]
+        elif progress.seek_seq != last_seen_seek and debouncer.last_schedule <= last_job_at:
+            last_seen_seek = progress.seek_seq
+            if current_meta is not None and meta_path.exists():
+                log.info("track seek detected, updating presence timer")
+                send_update(current_meta, wait_progress=False, throttle=RESUME_THROTTLE, force=True)
+        elif (
+            last_payload is not None
+            and bridge.idle_for() >= bridge.min_interval
+            and time.monotonic() - debouncer.last_schedule >= HEARTBEAT_QUIET
+        ):
+            bridge.update(last_payload, force=True)
         elif timer_pending:
             snap = progress.snapshot(max_age=PAUSE_TIMEOUT, raw=True)
             if (
@@ -1250,11 +1315,6 @@ def run_worker(
                 if meta and meta.get("title"):
                     log.info("track progress arrived, refreshing presence timer")
                     send_update(meta, wait_progress=False, throttle=RESUME_THROTTLE)
-        elif progress.seek_seq != last_seen_seek:
-            last_seen_seek = progress.seek_seq
-            if current_meta is not None and meta_path.exists():
-                log.info("track seek detected, updating presence timer")
-                send_update(current_meta, wait_progress=False, throttle=RESUME_THROTTLE, force=True)
     bridge.close()
 
 
@@ -1358,8 +1418,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-browser", action="store_true", help="do not open the web UI in a browser on startup")
     parser.add_argument("--config", default=None, help="path for the presence-lines config (default ~/.config/airplay-presence/config.json)")
     parser.add_argument("--no-uxplay", action="store_true", help="do not spawn uxplay; watch files written by an externally started uxplay")
-    parser.add_argument("--debounce", type=float, default=0.5, help="seconds to wait after the last file event")
-    parser.add_argument("--min-interval", type=float, default=15.0, help="minimum seconds between regular Discord updates")
+    parser.add_argument("--debounce", type=float, default=1.5, help="seconds to wait after the last metadata file event; rapid track changes within this window collapse into one update")
+    parser.add_argument("--min-interval", type=float, default=5.0, help="minimum seconds between Discord updates; the presence is also re-sent at this cadence even when unchanged")
     parser.add_argument("--dry-run", action="store_true", help="log payloads instead of talking to Discord")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
@@ -1435,7 +1495,7 @@ def main() -> int:
     bridge.start(failed, stop_event)
     worker = threading.Thread(
         target=run_worker,
-        args=(meta_path, image_path, bridge, artwork, config, jobs, stop_event, state, progress, misses, mpris),
+        args=(meta_path, image_path, bridge, artwork, config, jobs, stop_event, state, progress, misses, mpris, debouncer),
         daemon=True,
     )
     worker.start()
