@@ -36,6 +36,7 @@ import argparse
 import asyncio
 import collections
 import hashlib
+import itertools
 import json
 import logging
 import os
@@ -78,7 +79,12 @@ except ImportError:
     MPRIS_AVAILABLE = False
 
 FIELD_LIMIT = 128
-UPLOAD_URL = "https://catbox.moe/user/api.php"
+UPLOAD_URL = "https://litterbox.catbox.moe/resources/internals/api.php"
+UPLOAD_EXPIRY = "1h"
+UPLOAD_TTL = 60 * 60
+UPLOAD_RETRY = 60.0
+UPLOAD_VERIFY_TIMEOUT = 10.0
+UPLOAD_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
 PAUSE_TIMEOUT = 5.0
 RESUME_THROTTLE = 2.0
 SEEK_FORWARD_JUMP = 4.0
@@ -296,14 +302,26 @@ def valid_art_bytes(data: bytes) -> bool:
     return len(data) >= MIN_ART_BYTES and data[:2] == b"\xff\xd8" and b"\xff\xd9" in data[-4:]
 
 
+_image_nonce = itertools.count(1)
+
+
+def fresh_image_url(url: str) -> str:
+    return f"{url}?v={next(_image_nonce)}"
+
+
+def read_valid_art(path: Path) -> bytes | None:
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return None
+    return data if valid_art_bytes(data) else None
+
+
 def wait_valid_art(path: Path, timeout: float = ART_SETTLE_TIMEOUT) -> bytes | None:
     deadline = time.monotonic() + timeout
     while True:
-        try:
-            data = path.read_bytes()
-        except OSError:
-            data = b""
-        if valid_art_bytes(data):
+        data = read_valid_art(path)
+        if data is not None:
             return data
         if time.monotonic() >= deadline:
             return None
@@ -313,22 +331,23 @@ def wait_valid_art(path: Path, timeout: float = ART_SETTLE_TIMEOUT) -> bytes | N
 class ImageUploader:
     def __init__(self, enabled: bool):
         self.enabled = enabled
-        self._cache: dict[str, str] = {}
+        self._cache: dict[str, tuple[str, float]] = {}
 
-    def url_for(self, path: Path) -> str | None:
+    def url_for(self, path: Path, wait: bool = True) -> str | None:
         if not self.enabled:
             return None
-        data = wait_valid_art(path)
+        data = wait_valid_art(path) if wait else read_valid_art(path)
         if data is None:
-            log.info("no valid cover art file to upload")
+            if wait:
+                log.info("no valid cover art file to upload")
             return None
         digest = hashlib.sha256(data).hexdigest()
         cached = self._cache.get(digest)
-        if cached:
-            return cached
+        if cached and time.monotonic() - cached[1] < UPLOAD_TTL:
+            return cached[0]
         url = self._upload(data)
         if url:
-            self._cache[digest] = url
+            self._cache[digest] = (url, time.monotonic())
         return url
 
     def _upload(self, data: bytes) -> str | None:
@@ -337,6 +356,8 @@ class ImageUploader:
             f"--{boundary}\r\n".encode(),
             b'Content-Disposition: form-data; name="reqtype"\r\n\r\n',
             b"fileupload",
+            f"\r\n--{boundary}\r\n".encode(),
+            f'Content-Disposition: form-data; name="time"\r\n\r\n{UPLOAD_EXPIRY}'.encode(),
             f"\r\n--{boundary}\r\n".encode(),
             b'Content-Disposition: form-data; name="fileToUpload"; filename="cover.jpg"\r\n',
             b"Content-Type: image/jpeg\r\n\r\n",
@@ -348,7 +369,7 @@ class ImageUploader:
             data=body,
             headers={
                 "Content-Type": f"multipart/form-data; boundary={boundary}",
-                "User-Agent": "airplay-presence/1.0",
+                "User-Agent": UPLOAD_USER_AGENT,
             },
             method="POST",
         )
@@ -361,8 +382,27 @@ class ImageUploader:
         if not url.startswith("https://"):
             log.warning("unexpected upload response: %r", url)
             return None
+        if not self._verify(url):
+            log.warning("uploaded cover art not reachable yet: %s", url)
+            return None
         log.info("uploaded cover art: %s", url)
         return url
+
+    def _verify(self, url: str) -> bool:
+        deadline = time.monotonic() + UPLOAD_VERIFY_TIMEOUT
+        request = urllib.request.Request(
+            url, method="HEAD", headers={"User-Agent": UPLOAD_USER_AGENT}
+        )
+        while True:
+            try:
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    if response.status == 200:
+                        return True
+            except (urllib.error.URLError, OSError):
+                pass
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.5)
 
 
 def norm_text(value: str) -> str:
@@ -372,22 +412,30 @@ def norm_text(value: str) -> str:
 
 
 class ArtworkResolver:
-    def __init__(self, uploader: ImageUploader):
+    def __init__(self, uploader: ImageUploader, itunes: bool = False):
         self.uploader = uploader
-        self._cache: dict[tuple[str, str], str | None] = {}
+        self.itunes = itunes
+        self._cache: dict[tuple[str, str], tuple[str, float]] = {}
+        self._last_fail = 0.0
 
-    def url_for(self, meta: dict, image_path: Path) -> str | None:
+    def url_for(self, meta: dict, image_path: Path, wait: bool = True) -> str | None:
         title = meta.get("title") or ""
         artist = meta.get("artist") or ""
         key = (title, artist)
-        if key in self._cache:
-            return self._cache[key]
-        url = self._lookup_itunes(title, artist)
+        now = time.monotonic()
+        cached = self._cache.get(key)
+        if cached and now - cached[1] < UPLOAD_TTL:
+            return cached[0]
+        if now - self._last_fail < UPLOAD_RETRY:
+            return cached[0] if cached and now - cached[1] < UPLOAD_TTL else None
+        url = self._lookup_itunes(title, artist) if self.itunes else None
         if not url:
-            url = self.uploader.url_for(image_path)
+            url = self.uploader.url_for(image_path, wait=wait)
         if url:
-            self._cache[key] = url
-        return url
+            self._cache[key] = (url, time.monotonic())
+            return url
+        self._last_fail = now
+        return cached[0] if cached and now - cached[1] < UPLOAD_TTL else None
 
     def _lookup_itunes(self, title: str, artist: str) -> str | None:
         if not title:
@@ -417,7 +465,7 @@ class ArtworkResolver:
                 url = art.replace("100x100bb", "1000x1000bb")
                 log.info("artwork from iTunes: %s", url)
                 return url
-        log.info("no iTunes match for %r, falling back to catbox upload", title)
+        log.info("no iTunes match for %r, falling back to litterbox upload", title)
         return None
 
 
@@ -1208,7 +1256,12 @@ def run_worker(
         current_image = image_url
         if mpris is not None:
             mpris.publish(meta, image_url, paused=False)
-        payload = build_payload(meta, image_url, progress_snap, config.get())
+        payload = build_payload(
+            meta,
+            fresh_image_url(image_url) if image_url else None,
+            progress_snap,
+            config.get(),
+        )
         log.info(
             "now playing: %s | %s | %s%s",
             meta.get("title"),
@@ -1302,7 +1355,18 @@ def run_worker(
             and bridge.idle_for() >= bridge.min_interval
             and time.monotonic() - debouncer.last_schedule >= HEARTBEAT_QUIET
         ):
-            bridge.update(last_payload, force=True)
+            payload = dict(last_payload)
+            if current_meta is not None:
+                image_url = artwork.url_for(current_meta, image_path, wait=False)
+                if image_url != current_image:
+                    current_image = image_url
+                    if mpris is not None:
+                        mpris.publish(current_meta, image_url, paused=False)
+                if image_url:
+                    payload["large_image"] = fresh_image_url(image_url)
+                else:
+                    payload.pop("large_image", None)
+            bridge.update(payload, force=True)
         elif timer_pending:
             snap = progress.snapshot(max_age=PAUSE_TIMEOUT, raw=True)
             if (
@@ -1410,6 +1474,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--meta-file", default="/tmp/uxplay/meta.txt")
     parser.add_argument("--image-file", default="/tmp/uxplay/image.jpeg")
     parser.add_argument("--no-image", action="store_true", help="do not upload cover art")
+    parser.add_argument("--itunes-art", action="store_true", help="look up cover art on iTunes before uploading (upload-only by default)")
     parser.add_argument("--port", type=int, default=None, help="AirPlay TCP port for uxplay (default: uxplay's legacy port set)")
     parser.add_argument("--name", default=None, help="AirPlay server name shown on clients")
     parser.add_argument("--ui-port", type=int, default=8080, help="port for the local web UI (default 8080)")
@@ -1454,7 +1519,7 @@ def main() -> int:
     state = AppState(progress)
     config = PresenceConfig(config_path)
     bridge = PresenceBridge(args.client_id or "", args.min_interval, args.dry_run)
-    artwork = ArtworkResolver(ImageUploader(not args.no_image))
+    artwork = ArtworkResolver(ImageUploader(not args.no_image), itunes=args.itunes_art)
     jobs: "queue.Queue[str]" = queue.Queue()
     stop_event = threading.Event()
     failed = threading.Event()
