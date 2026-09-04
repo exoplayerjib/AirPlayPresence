@@ -93,7 +93,7 @@ No bot, no OAuth, no token needed.
 The Now-Playing page opens in your browser automatically. On your phone:
 
 1. Open **Apple Music** (or any audio app) and start playing.
-2. Tap the **AirPlay** icon → select your AirPlayPresence server (default name `uxplay`, change with `--name`).
+2. Tap the **AirPlay** icon → select your AirPlayPresence server (default name `AirPlayPresence`, change with `--name`).
 
 Discord updates within a couple of seconds — cover art, track, artist, album, and a live countdown. Pause or disconnect and the presence clears; resume and it comes back with the right timer.
 
@@ -107,6 +107,7 @@ The page that opens on launch (`http://127.0.0.1:8080`) has a **"Discord presenc
 
 - **First line / Second line / Third line / Fourth line** — what goes on each Discord presence line: Title, Artist, Album, Album artist, Genre, a fixed "Apple Music" text, your own custom text, or nothing.
 - **Member list shows** — which line Discord uses next to your username.
+- **Rotate member-list line** — cycle that line through the presets while you listen: drag the lines into the rotation order, untick any line to leave it out, pick the interval, and a green "showing" badge marks the line Discord is displaying right now. Turn the rotation off to pin the line with the selector above.
 
 Changes apply live and are saved to `~/.config/airplay-presence/config.json`.
 
@@ -116,7 +117,7 @@ Changes apply live and are saved to `~/.config/airplay-presence/config.json`.
 |---|---|---|
 | `--client-id` / `$DISCORD_CLIENT_ID` | — | Discord application ID |
 | `--port N` | legacy port set | AirPlay TCP port (uses N, N+1, N+2) |
-| `--name NAME` | `uxplay` | AirPlay server name shown on devices |
+| `--name NAME` | `AirPlayPresence` | AirPlay server name shown on devices |
 | `--ui-port N` | 8080 | Local web UI port |
 | `--no-ui` / `--no-browser` | — | Disable the web UI / auto-open |
 | `--no-mpris` | — | Disable the D-Bus media player |

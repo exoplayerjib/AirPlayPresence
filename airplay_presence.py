@@ -118,7 +118,12 @@ DEFAULT_CONFIG = {
     "state": "artist",
     "large_text": "album",
     "status_display": "state",
+    "status_rotation": False,
+    "status_rotation_order": ["name", "details", "state"],
+    "status_rotation_interval": 30,
 }
+ROTATION_MIN_INTERVAL = 10
+ROTATION_MAX_INTERVAL = 600
 
 
 def valid_source(value) -> bool:
@@ -153,6 +158,17 @@ h1{font-size:1.3rem;margin:18px 0 4px;overflow-wrap:anywhere}
 .settings .row{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:6px 16px}
 .settings select{background:#262b36;color:#e8eaf0;border:1px solid #33384a;border-radius:6px;padding:4px 8px;font-size:.85rem}
 .settings input{background:#262b36;color:#e8eaf0;border:1px solid #33384a;border-radius:6px;padding:4px 8px;font-size:.85rem;width:118px}
+.rotate-box{margin:8px 16px 12px;padding:10px;border:1px solid #33384a;border-radius:8px}
+.rotate-head{display:flex;align-items:center;gap:8px;color:#e8eaf0;cursor:pointer;user-select:none}
+.rotate-head input{width:auto}
+#rot-list{list-style:none;margin:8px 0 0;padding:0;display:flex;flex-direction:column;gap:6px}
+#rot-list li{display:flex;align-items:center;gap:8px;padding:6px 8px;background:#262b36;border:1px solid #33384a;border-radius:6px;cursor:grab;user-select:none}
+#rot-list li.off{opacity:.45;cursor:default}
+#rot-list li.drag{opacity:.5;border-style:dashed}
+#rot-list li.over{border-color:#5865f2}
+#rot-list .grip{color:#6b7280;cursor:grab}
+#rot-list .live{margin-left:auto;color:#23a55a;font-size:.75rem;font-weight:600;text-transform:uppercase;letter-spacing:.04em}
+.rotate-box .row{padding:8px 0 0}
 </style>
 </head>
 <body>
@@ -175,6 +191,19 @@ h1{font-size:1.3rem;margin:18px 0 4px;overflow-wrap:anywhere}
   <div class="row"><span>Third line</span><select id="sel-state"></select></div>
   <div class="row"><span>Fourth line (image text)</span><select id="sel-large_text"></select></div>
   <div class="row"><span>Member list shows</span><select id="sel-status_display"></select></div>
+  <div class="rotate-box">
+    <label class="rotate-head"><input type="checkbox" id="rot-enable"> Rotate member-list line</label>
+    <ul id="rot-list"></ul>
+    <div class="row"><span>Every</span>
+      <select id="rot-interval">
+        <option value="15">15 s</option>
+        <option value="30">30 s</option>
+        <option value="60">1 min</option>
+        <option value="120">2 min</option>
+        <option value="300">5 min</option>
+      </select>
+    </div>
+  </div>
 </details>
 <script>
 const el = id => document.getElementById(id);
@@ -229,6 +258,75 @@ for (const [value, label] of DISPLAYS) {
 selD.addEventListener("change", async () => {
   if (!await postConfig({ ...cfg, status_display: selD.value })) selD.value = cfg ? cfg.status_display : "state";
 });
+const rotEnable = el("rot-enable");
+const rotList = el("rot-list");
+const rotInterval = el("rot-interval");
+const rotOrder = () => [...rotList.children].filter(li => !li.classList.contains("off")).map(li => li.dataset.value);
+let dragVal = null;
+function renderRot() {
+  const valid = DISPLAYS.map(d => d[0]);
+  const saved = Array.isArray(cfg.status_rotation_order) ? cfg.status_rotation_order.filter(v => valid.includes(v)) : [];
+  const enabled = [...new Set(saved)];
+  const off = valid.filter(v => !enabled.includes(v));
+  rotList.innerHTML = "";
+  for (const value of [...enabled, ...off]) {
+    const on = enabled.includes(value);
+    const label = DISPLAYS.find(d => d[0] === value)[1];
+    const li = document.createElement("li");
+    li.dataset.value = value;
+    li.draggable = on;
+    if (!on) li.classList.add("off");
+    const grip = document.createElement("span");
+    grip.className = "grip"; grip.textContent = "⠿";
+    const cb = document.createElement("input");
+    cb.type = "checkbox"; cb.checked = on; cb.style.width = "auto";
+    const lbl = document.createElement("span"); lbl.textContent = label;
+    const live = document.createElement("span"); live.className = "live";
+    li.append(grip, cb, lbl, live);
+    cb.addEventListener("change", () => {
+      let order = rotOrder();
+      if (cb.checked) { if (!order.includes(value)) order.push(value); }
+      else order = order.filter(v => v !== value);
+      saveRot({ status_rotation_order: order });
+    });
+    li.addEventListener("dragstart", e => {
+      dragVal = value; li.classList.add("drag");
+      e.dataTransfer.effectAllowed = "move";
+      try { e.dataTransfer.setData("text/plain", value); } catch (err) {}
+    });
+    li.addEventListener("dragend", () => {
+      dragVal = null; li.classList.remove("drag");
+      [...rotList.children].forEach(x => x.classList.remove("over"));
+    });
+    li.addEventListener("dragover", e => {
+      if (dragVal && dragVal !== value && on) { e.preventDefault(); li.classList.add("over"); }
+    });
+    li.addEventListener("dragleave", () => li.classList.remove("over"));
+    li.addEventListener("drop", e => {
+      e.preventDefault(); li.classList.remove("over");
+      if (!dragVal || dragVal === value || !on) return;
+      const order = rotOrder();
+      order.splice(order.indexOf(dragVal), 1);
+      order.splice(order.indexOf(value), 0, dragVal);
+      saveRot({ status_rotation_order: order });
+    });
+    rotList.appendChild(li);
+  }
+}
+function syncRotUi() {
+  const on = !!(cfg && cfg.status_rotation);
+  selD.disabled = on;
+  selD.parentElement.style.opacity = on ? ".45" : "";
+  rotEnable.checked = on;
+  rotInterval.value = String((cfg && cfg.status_rotation_interval) || 30);
+}
+async function saveRot(patch) {
+  await postConfig({ ...cfg, ...patch });
+  syncRotUi();
+  renderRot();
+}
+rotEnable.addEventListener("change", () => saveRot({ status_rotation: rotEnable.checked }));
+rotInterval.addEventListener("change", () => saveRot({ status_rotation_interval: parseInt(rotInterval.value, 10) }));
 (async () => {
   try { cfg = await (await fetch("/config")).json(); } catch (e) { return; }
   for (const [slot, sel] of SLOTS) {
@@ -237,13 +335,21 @@ selD.addEventListener("change", async () => {
     else el(sel).value = v;
   }
   selD.value = cfg.status_display || "state";
+  syncRotUi();
+  renderRot();
 })();
+function markLive(line) {
+  [...rotList.children].forEach(li => {
+    li.querySelector(".live").textContent = li.dataset.value === line ? "showing" : "";
+  });
+}
 async function tick() {
   try {
     const s = await (await fetch("/state")).json();
     const visible = s.playing || s.paused;
     el("idle").style.display = visible ? "none" : "block";
     el("now").style.display = visible ? "block" : "none";
+    markLive(visible ? s.status_line : null);
     if (!visible) return;
     el("paused").style.display = s.paused ? "block" : "none";
     if (el("art").dataset.src !== s.image) { el("art").src = s.image; el("art").dataset.src = s.image; }
@@ -494,6 +600,17 @@ class PresenceConfig:
         display = data.get("status_display")
         if display in STATUS_DISPLAY_OPTIONS:
             mapping["status_display"] = display
+        mapping["status_rotation"] = bool(data.get("status_rotation"))
+        order = data.get("status_rotation_order")
+        if isinstance(order, list):
+            mapping["status_rotation_order"] = list(
+                dict.fromkeys(v for v in order if v in STATUS_DISPLAY_OPTIONS)
+            )
+        interval = data.get("status_rotation_interval")
+        if isinstance(interval, int):
+            mapping["status_rotation_interval"] = max(
+                ROTATION_MIN_INTERVAL, min(ROTATION_MAX_INTERVAL, interval)
+            )
         with self._lock:
             self._mapping = mapping
 
@@ -576,12 +693,17 @@ class AppState:
         self._meta: dict | None = None
         self._image: str | None = None
         self._paused = False
+        self._status_line: str | None = None
 
     def set_now_playing(self, meta: dict, image: str | None) -> None:
         with self._lock:
             self._meta = dict(meta)
             self._image = image
             self._paused = False
+
+    def set_status_line(self, line: str | None) -> None:
+        with self._lock:
+            self._status_line = line
 
     def set_paused(self) -> None:
         with self._lock:
@@ -598,12 +720,14 @@ class AppState:
             meta = dict(self._meta) if self._meta else None
             image = self._image
             paused = self._paused
+            status_line = self._status_line
         if not meta:
-            return {"playing": False, "paused": False}
+            return {"playing": False, "paused": False, "status_line": status_line}
         progress = self._progress.snapshot()
         return {
             "playing": not paused,
             "paused": paused,
+            "status_line": status_line,
             "title": meta.get("title"),
             "artist": meta.get("artist") or "",
             "album": meta.get("album") or "",
@@ -1256,12 +1380,17 @@ def run_worker(
         current_image = image_url
         if mpris is not None:
             mpris.publish(meta, image_url, paused=False)
+        mapping = config.get()
         payload = build_payload(
             meta,
             fresh_image_url(image_url) if image_url else None,
             progress_snap,
-            config.get(),
+            mapping,
         )
+        line = status_line_for(mapping)
+        if mapping.get("status_rotation"):
+            payload["status_display_type"] = STATUS_DISPLAY_MAP[line]
+        state.set_status_line(line)
         log.info(
             "now playing: %s | %s | %s%s",
             meta.get("title"),
@@ -1297,6 +1426,14 @@ def run_worker(
     active = False
     last_payload: dict | None = None
     last_job_at = 0.0
+    rot_idx = 0
+    last_rotation = time.monotonic()
+
+    def status_line_for(mapping: dict) -> str:
+        order = mapping.get("status_rotation_order") or []
+        if mapping.get("status_rotation") and order:
+            return order[rot_idx % len(order)]
+        return mapping.get("status_display") or "state"
     while not stop_event.is_set():
         try:
             job = jobs.get(timeout=0.5)
@@ -1366,6 +1503,19 @@ def run_worker(
                     payload["large_image"] = fresh_image_url(image_url)
                 else:
                     payload.pop("large_image", None)
+            mapping = config.get()
+            if mapping.get("status_rotation"):
+                order = mapping.get("status_rotation_order") or []
+                nowm = time.monotonic()
+                if len(order) > 1 and nowm - last_rotation >= mapping.get(
+                    "status_rotation_interval", 30
+                ):
+                    rot_idx = (rot_idx + 1) % len(order)
+                    last_rotation = nowm
+                    log.info("member-list line rotated to %s", order[rot_idx])
+                line = status_line_for(mapping)
+                payload["status_display_type"] = STATUS_DISPLAY_MAP[line]
+                state.set_status_line(line)
             bridge.update(payload, force=True)
         elif timer_pending:
             snap = progress.snapshot(max_age=PAUSE_TIMEOUT, raw=True)
@@ -1448,6 +1598,30 @@ def make_ui_server(
                     self._send(400, "application/json", b'{"error": "invalid fields"}')
                     return
                 mapping["status_display"] = display
+            mapping.update(
+                {k: v for k, v in config.get().items() if k.startswith("status_rotation")}
+            )
+            rotation = data.get("status_rotation")
+            if rotation is not None:
+                mapping["status_rotation"] = bool(rotation)
+            order = data.get("status_rotation_order")
+            if order is not None:
+                if (
+                    not isinstance(order, list)
+                    or any(v not in STATUS_DISPLAY_OPTIONS for v in order)
+                    or len(set(order)) != len(order)
+                ):
+                    self._send(400, "application/json", b'{"error": "invalid fields"}')
+                    return
+                mapping["status_rotation_order"] = order
+            interval = data.get("status_rotation_interval")
+            if interval is not None:
+                if not isinstance(interval, int) or isinstance(interval, bool):
+                    self._send(400, "application/json", b'{"error": "invalid fields"}')
+                    return
+                mapping["status_rotation_interval"] = max(
+                    ROTATION_MIN_INTERVAL, min(ROTATION_MAX_INTERVAL, interval)
+                )
             saved = config.set(mapping)
             on_config_change()
             self._send(200, "application/json", json.dumps(saved).encode())
@@ -1476,7 +1650,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-image", action="store_true", help="do not upload cover art")
     parser.add_argument("--itunes-art", action="store_true", help="look up cover art on iTunes before uploading (upload-only by default)")
     parser.add_argument("--port", type=int, default=None, help="AirPlay TCP port for uxplay (default: uxplay's legacy port set)")
-    parser.add_argument("--name", default=None, help="AirPlay server name shown on clients")
+    parser.add_argument("--name", default="AirPlayPresence", help="AirPlay server name shown on clients (default: AirPlayPresence)")
     parser.add_argument("--ui-port", type=int, default=8080, help="port for the local web UI (default 8080)")
     parser.add_argument("--no-ui", action="store_true", help="disable the local web UI")
     parser.add_argument("--no-mpris", action="store_true", help="do not expose an MPRIS media player on D-Bus")
