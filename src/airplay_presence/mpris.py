@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import asyncio
 import threading
+from pathlib import Path
 
 try:
     from dbus_next import PropertyAccess, RequestNameReply
@@ -15,6 +16,7 @@ except ImportError:
     MPRIS_AVAILABLE = False
 
 from .constants import MPRIS_NAME, MPRIS_PATH
+from .state import ProgressState
 from .utils import clip
 
 

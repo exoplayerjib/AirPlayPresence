@@ -9,6 +9,7 @@ from pathlib import Path
 from .artwork import valid_art_bytes
 from .config import (
     ROTATION_MAX_INTERVAL, ROTATION_MIN_INTERVAL, STATUS_DISPLAY_OPTIONS, SLOTS, valid_source,
+    PresenceConfig,
 )
 from .state import AppState
 

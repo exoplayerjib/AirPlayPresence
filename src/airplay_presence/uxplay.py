@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import logging
+import argparse
 import collections
 import subprocess
-import time
+import threading
+from pathlib import Path
 
-from .constants import PROGRESS_RE, SEEK_BASE_MAX_AGE
+from .constants import PROGRESS_RE
+from .state import ProgressState
 
 
 log = logging.getLogger("airplay-presence")

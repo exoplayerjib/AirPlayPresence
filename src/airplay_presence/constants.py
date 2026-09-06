@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 
-from pypresence import ActivityType, StatusDisplayType
+from pypresence import StatusDisplayType
 
 FIELD_LIMIT = 128
 UPLOAD_URL = "https://litterbox.catbox.moe/resources/internals/api.php"

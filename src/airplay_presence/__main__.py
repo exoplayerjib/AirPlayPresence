@@ -17,7 +17,6 @@ from .ringlog import RingBufferHandler
 from .artwork import ArtworkResolver, ImageUploader
 from .cli import parse_args
 from .config import PresenceConfig
-from .constants import PAUSE_TIMEOUT
 from .mpris import MPRIS_AVAILABLE, MprisServer
 from .presence import PresenceBridge
 from .state import AppState, ProgressState
@@ -32,7 +31,7 @@ def _setup_logging(args, stdout_is_tty: bool) -> "RingBufferHandler | None":
     level = logging.DEBUG if args.verbose else logging.INFO
     if not args.no_tui and stdout_is_tty:
         try:
-            import curses  # noqa: F401
+            import curses  # noqa: F401  (availability probe only)
         except ImportError:
             stdout_is_tty = False
     if not args.no_tui and stdout_is_tty:
