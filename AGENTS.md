@@ -2,23 +2,29 @@
 
 ## What this is
 
-Project **AirPlayPresence** (GPLv3): single-file script `airplay_presence.py` that spawns `uxplay` itself as a headless audio-only AirPlay server (`-p`, `-vs 0`, `-md`, `-ca`), watches the metadata/cover files uxplay writes, and feeds three outputs: Discord Rich Presence (pypresence IPC, with elapsed/remaining timers), an MPRIS player on D-Bus, and a local web UI (`/`, `/state`, `/art`, `/config` on `127.0.0.1:8080`). No test suite, no lint/CI — don't invent commands for these.
+Project **AirPlayPresence** (GPLv3): a Python package at `src/airplay_presence/` that spawns `uxplay` itself as a headless audio-only AirPlay server (`-p`, `-vs 0`, `-md`, `-ca`), watches the metadata/cover files uxplay writes, and feeds four outputs: Discord Rich Presence (pypresence IPC, with elapsed/remaining timers), an MPRIS player on D-Bus, a local web UI (`/`, `/state`, `/art`, `/config` on `127.0.0.1:8080`), and a curses terminal UI (details pane + toggleable log side panel; `--no-tui` restores the plain log). `run.sh` at the repo root launches everything with the default parameters; it takes the Discord client ID as an argument (storing it in the gitignored repo-local `client-id` file, mode 600) or falls back through `$DISCORD_CLIENT_ID` to the stored file, and creates/validates the venv itself. No test suite, no lint/CI — don't invent commands for these.
+
+## Layout
+
+- `src/airplay_presence/`: `constants.py` (all module-level knobs, `PROGRESS_RE`, `STATUS_DISPLAY_MAP`), `config.py` (`valid_source`, `PresenceConfig`), `state.py` (`ProgressState`, `AppState` — also mirrors the last payload via `set_payload` for the TUI), `artwork.py` (`ImageUploader`, `ArtworkResolver`, art validation; `cache_info()`/`retry_gate_remaining()` power the TUI's cache panel), `mpris.py`, `presence.py` (`PresenceBridge` — `connected` + `last_send_age` properties for the TUI, `build_payload`), `uxplay.py` (spawn + stdout reader + seek helpers), `worker.py` (`run_worker`, `Debouncer`, `MetaFileHandler`), `webui.py` (`PAGE` + server), `ringlog.py` (`RingBufferHandler` — thread-safe ring buffer the TUI reads), `tui.py` (`run()` curses loop), `cli.py` (`parse_args`), `__main__.py` (`main()`/entry point).
+- `pyproject.toml` owns metadata and exact-pinned deps (pypresence 4.6.2, watchdog 6.0.0, dbus-next 0.2.3); `run.sh` installs `-e .` into `.venv/`.
 
 ## Environment
 
-- Python 3.10+ (venv at `.venv/`, Python 3.14 here); deps exact-pinned in `requirements.txt`: pypresence 4.6.2, watchdog 6.0.0, dbus-next 0.2.3.
-- Install: `.venv/bin/pip install -r requirements.txt`
+- Python 3.10+ (venv at `.venv/`, Python 3.14 here); deps exact-pinned in `pyproject.toml`.
+- Install: `.venv/bin/pip install -e .` (or just `./run.sh`, which does it).
 - Regenerating the venv after moving the repo folder is required (venv scripts embed absolute paths).
 
 ## Verification
 
-- Syntax: `.venv/bin/python -m py_compile airplay_presence.py`
-- Behavior: `.venv/bin/python airplay_presence.py --dry-run` — logs payloads instead of talking to Discord (no client ID needed), still spawns uxplay and honors the send throttle.
+- Syntax: `.venv/bin/python -m py_compile src/airplay_presence/*.py`
+- Behavior: `.venv/bin/python -m airplay_presence --dry-run` — logs payloads instead of talking to Discord (no client ID needed), still spawns uxplay and honors the send throttle.
+- TUI: under a pty (e.g. a Python `pty` subprocess harness) it renders the details view; `l` toggles the log side panel, `w` opens the web UI, `q` quits (exit code 0). `--no-tui` or a non-tty stdout keeps the classic stderr log.
 - Without an AirPlay device: `--dry-run --no-uxplay` plus a hand-written `Key: value` meta file exercises watcher/payloads/UI. For seeks/timers, shim a fake `uxplay` on PATH that writes the meta file and prints the progress line (see below) — that runs the whole pipeline.
 
 ## Runtime prerequisites (not code)
 
-- `uxplay` binary on PATH; Discord desktop app running; client ID via `--client-id` or `$DISCORD_CLIENT_ID`; a D-Bus session bus for MPRIS (missing → logged and disabled).
+- `uxplay` binary on PATH; Discord desktop app running; client ID via `--client-id`, `$DISCORD_CLIENT_ID`, or the `client-id` file (run.sh wires the precedence); a D-Bus session bus for MPRIS (missing → logged and disabled).
 - AirPlay ports must be open (UDP 5353, TCP 7100/7000/7001, UDP 6000/6001/7011 — see README firewall section).
 
 ## Non-obvious constraints when editing
@@ -36,3 +42,4 @@ Project **AirPlayPresence** (GPLv3): single-file script `airplay_presence.py` th
 - **Cover art**: on this branch, upload-only by default — valid art goes to litterbox.catbox.moe with `time=1h`. Litterbox rejects non-browser User-Agents and rate-limited IPs with 412 ("No file!") — `_upload` sends a Mozilla UA for this reason. Every upload is verified before use: `_verify` HEAD-polls the returned URL until it answers 200 (up to `UPLOAD_VERIFY_TIMEOUT` 10s), because the litterbox CDN can lag behind the upload response — an unverified link is what let Discord pin the "?" placeholder for the URL's whole lifetime. Both the `ImageUploader` (per-digest) and `ArtworkResolver` (per-track) caches store `(url, timestamp)` and treat entries as expired after `UPLOAD_TTL` (1h, matched to litterbox's expiry) — no proactive refresh; the next lookup after expiry (usually a heartbeat) uploads a replacement link then. `--itunes-art` re-enables iTunes Search first (artworkUrl100 → 1000x1000) with upload fallback. On refresh failure `ArtworkResolver._last_fail` opens a `UPLOAD_RETRY` (60s) gate before the next attempt (heartbeats would otherwise retry every `--min-interval`); within the gate `url_for` returns the cached URL without network calls — but only while it is still within TTL: an expired link is never served (the heartbeat drops `large_image` instead — no art beats a broken "?" box). `valid_art_bytes` gates uploads (≥ `MIN_ART_BYTES`, JPEG SOI/EOI) because uxplay writes a 95-byte 1×1 PNG placeholder into the `-ca` file on stream changes and real art often arrives after the metadata event — `wait_valid_art` polls up to `ART_SETTLE_TIMEOUT` (5s); heartbeat lookups use `read_valid_art` (single read, no poll). Failed lookups are not cached as values (they retry after the gate). `/art` applies the same gate.
 - **MPRIS**: dbus-next asyncio loop in a daemon thread; publishes metadata/status/position. Control methods raise `NotSupported`, `CanControl=false` — uxplay's raop is receive-only (`/rate`/`/setProperty` are client→server), the phone cannot be commanded. dbus-next is imported defensively: absent library or bus just logs and disables. GNOME queries `DesktopEntry` on the root interface — keep it present.
 - **Discord rate limits**: ~5 updates/20s. The 5s cadence is the regular heartbeat (4 sends/20s — at the limit's edge; `ServerError` trips are absorbed by the sender's retry path, which sleeps `min_interval` and retries). Clears/resume/refresh/seek use the 2s floor. Don't remove either.
+- **TUI threading**: curses runs on a *daemon thread* (not the main thread — main keeps the supervision loop); it reads the shared `RingBufferHandler` buffer and never touches other threads' state directly except through snapshots (`AppState.snapshot`/`payload()`, `bridge.connected`/`last_send_age`, `mpris.is_connected`). On quit or crash the TUI thread sets `stop_event` (via the wrapper's `finally`) — never leave main hanging on a dead UI. Non-tty stdout or `ImportError: curses` falls back to plain stderr logging automatically (`fallback_logging()` re-installs the StreamHandler after the ring was initially attached). The `w` hotkey and footer button only spawn `webbrowser.open` in its own thread — never let the curses thread import browser blockers.

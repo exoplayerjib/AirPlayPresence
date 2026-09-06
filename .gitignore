@@ -1,3 +1,7 @@
 .venv/
 __pycache__/
 *.pyc
+*.egg-info/
+client-id
+dist/
+build/

@@ -15,6 +15,7 @@ No more "Listening to Spotify" envy. Stream Apple Music to Linux, and Discord fi
 - **MPRIS media player** — shows up in GNOME/KDE media controls and `playerctl` with title, artist, album, art, and position.
 - **Honest pause handling** — pausing or ending the stream clears the presence; resuming restores it automatically.
 - **Local web page** — cover art, track info, and a progress bar at `http://127.0.0.1:8080`.
+- **Terminal UI** — live details view (track, exact Discord payload, session internals, cover-art cache) with a toggleable log side panel; `--no-tui` restores the plain log.
 
 ## Requirements
 
@@ -72,8 +73,15 @@ Using a custom port with `--port N`? Open **TCP and UDP N, N+1, N+2** instead (e
 ```bash
 git clone https://github.com/exoplayerjib/AirplayPresence.git
 cd AirPlayPresence
-python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
+./run.sh YOUR_APPLICATION_ID
+```
+
+`run.sh` creates the virtualenv, installs the package (deps come from `pyproject.toml`), stores the token in `client-id` (repo-local, gitignored, mode 600), and launches the app. Next time just:
+
+```bash
+./run.sh                     # uses the stored token
+DISCORD_CLIENT_ID=xxx ./run.sh   # or: from the environment
+./run.sh -- --dry-run            # extra CLI flags after --
 ```
 
 ### 4. Create the Discord application (one-time)
@@ -87,8 +95,10 @@ No bot, no OAuth, no token needed.
 ## Run
 
 ```bash
-.venv/bin/python airplay_presence.py --client-id YOUR_APPLICATION_ID
+./run.sh                # token from client-id / $DISCORD_CLIENT_ID, default parameters
 ```
+
+(or directly: `.venv/bin/python -m airplay_presence --client-id YOUR_APPLICATION_ID`)
 
 The Now-Playing page opens in your browser automatically. On your phone:
 
@@ -98,6 +108,17 @@ The Now-Playing page opens in your browser automatically. On your phone:
 Discord updates within a couple of seconds — cover art, track, artist, album, and a live countdown. Pause or disconnect and the presence clears; resume and it comes back with the right timer.
 
 Useful without Discord too: `--dry-run` runs everything except the Discord connection (no client ID required).
+
+## Terminal UI
+
+In a terminal the app opens a curses interface instead of the plain log:
+
+- **Main pane** — live details: track & progress bar, the exact Discord payload (all four presence lines, art URL, start/end timers), and session internals (uxplay state, Discord connection, MPRIS, cover-art cache, config paths).
+- **Log button (L)** — opens the side panel with the live log (scrolleable; `G` re-follows the bottom). Press L again to close.
+- **Web UI button (W)** — opens the Now-Playing page in your browser.
+- **Q** quits cleanly. All footer buttons are mouse-clickable; `↑/↓/j/k` scrolls the main pane.
+
+Use `--no-tui` for the classic streaming log (piping output, systemd journaling fell back automatically when stdout is not a terminal).
 
 ## Configuration
 
@@ -129,6 +150,7 @@ Changes apply live and are saved to `~/.config/airplay-presence/config.json`.
 | `--debounce S` | 1.5 | Metadata file event debounce; rapid track changes within this window collapse into one update |
 | `--dry-run` | — | Log payloads instead of talking to Discord |
 | `--verbose` | — | Debug logging (includes all uxplay output) |
+| `--no-tui` | TUI on | Plain log output instead of the curses terminal UI (automatic when stdout is not a terminal) |
 | `--no-uxplay` | — | Attach to an already-running uxplay instead of spawning one |
 
 ## Run at login (systemd user service)
@@ -141,7 +163,7 @@ Description=AirPlayPresence (AirPlay to Discord Rich Presence)
 After=graphical-session.target
 
 [Service]
-ExecStart=%h/AirPlayPresence/.venv/bin/python %h/AirPlayPresence/airplay_presence.py --client-id YOUR_APPLICATION_ID
+ExecStart=%h/AirPlayPresence/run.sh --no-tui
 Restart=on-failure
 RestartSec=5
 

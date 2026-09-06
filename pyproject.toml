@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "airplay-presence"
+version = "1.1.0"
+description = "Show uxplay AirPlay Now-Playing metadata as Discord Rich Presence, with MPRIS and a local web UI."
+readme = "README.md"
+license = "GPL-3.0-or-later"
+requires-python = ">=3.10"
+dependencies = [
+    "pypresence==4.6.2",
+    "watchdog==6.0.0",
+    "dbus-next==0.2.3",
+]
+
+[project.scripts]
+airplay-presence = "airplay_presence.__main__:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

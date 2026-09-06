@@ -1,3 +1,0 @@
-pypresence==4.6.2
-watchdog==6.0.0
-dbus-next==0.2.3
