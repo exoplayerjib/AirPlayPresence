@@ -61,7 +61,18 @@ class ImageUploader:
         data = wait_valid_art(path) if wait else read_valid_art(path)
         if data is None:
             if wait:
-                log.info("no valid cover art file to upload")
+                try:
+                    raw = path.read_bytes()
+                    if raw:
+                        kind = "placeholder" if len(raw) < 200 else "wrong format"
+                        log.warning(
+                            "no valid cover art in %s (%d bytes, %s); retrying at the next heartbeat",
+                            path, len(raw), kind,
+                        )
+                    else:
+                        log.warning("cover art file %s is empty; retrying at the next heartbeat", path)
+                except OSError:
+                    log.warning("cover art file %s absent; retrying at the next heartbeat", path)
             return None
         digest = hashlib.sha256(data).hexdigest()
         cached = self._cache.get(digest)

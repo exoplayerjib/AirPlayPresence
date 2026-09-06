@@ -106,12 +106,17 @@ def detail_lines(state, extras: dict, width: int) -> list[str]:
             data = cover.read_bytes()
         except OSError:
             data = b""
-        if data:
-            size = len(data)
-            age = time.time() - cover.stat().st_mtime
-            wrap("cover art", f"{size} bytes, valid={valid_art_bytes(data)}, age {fmt_time(age)}")
+        if not data:
+            wrap("cover art", f"missing ({cover})")
         else:
-            wrap("cover art", "missing")
+            size = len(data)
+            try:
+                age = time.time() - cover.stat().st_mtime
+                age_text = f", changed {fmt_time(age)} ago"
+            except OSError:
+                age_text = ""
+            state_txt = "valid JPEG" if valid_art_bytes(data) else ("placeholder/wrong format" if size < 200 else "not a valid JPEG")
+            wrap("cover art", f"{size} bytes, {state_txt}{age_text}")
 
     header("cover art cache")
     uploader, resolver = extras.get("uploader"), extras.get("resolver")
