@@ -5,7 +5,7 @@ import queue
 import threading
 import time
 
-from pypresence import ActivityType
+from pypresence import ActivityType, Presence
 from pypresence.exceptions import (
     InvalidID, PipeClosed, PyPresenceException, ResponseTimeout, ServerError,
 )
