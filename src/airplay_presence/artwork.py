@@ -14,7 +14,8 @@ import uuid
 from pathlib import Path
 
 from .constants import (
-    MIN_ART_BYTES, ART_SETTLE_TIMEOUT, UPLOAD_EXPIRY, UPLOAD_RETRY,
+    MIN_ART_BYTES, ART_SETTLE_TIMEOUT, UPLOAD_EXPIRY, UPLOAD_GATE_EXTENDED_SECONDS,
+    UPLOAD_GATE_EXTENDED_STRIKES, UPLOAD_HTTP_FAILURE_BODY_CAPTURE, UPLOAD_RETRY,
     UPLOAD_TTL, UPLOAD_URL, UPLOAD_USER_AGENT, UPLOAD_VERIFY_TIMEOUT,
 )
 
@@ -119,6 +120,10 @@ class ImageUploader:
             headers={
                 "Content-Type": f"multipart/form-data; boundary={boundary}",
                 "User-Agent": UPLOAD_USER_AGENT,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Referer": "https://litterbox.catbox.moe/",
+                "Origin": "https://litterbox.catbox.moe",
             },
             method="POST",
         )
@@ -127,15 +132,15 @@ class ImageUploader:
                 url = response.read().decode("utf-8", "replace").strip()
         except urllib.error.HTTPError as exc:
             try:
-                body = exc.read(200).decode("utf-8", "replace").strip()
+                body = exc.read(UPLOAD_HTTP_FAILURE_BODY_CAPTURE).decode("utf-8", "replace").strip()
             except Exception:
                 body = ""
             self.last_http_status = exc.code
+            self.last_failure_kind = "network"
             log.warning(
                 "cover art upload rejected: HTTP %s from litterbox%s",
                 exc.code, (f"; body: {body!r}" if body else " (no body)"),
             )
-            self.last_failure_kind = "network"
             return None
         except (urllib.error.URLError, OSError) as exc:
             log.warning("cover art upload failed: %s", exc)
@@ -191,6 +196,8 @@ class ArtworkResolver:
         self._cache: dict[tuple[str, str], tuple[str, float]] = {}
         self.last_failure_kind: str | None = None
         self._last_fail = 0.0
+        self._gate_seconds = UPLOAD_RETRY
+        self._network_strikes = 0
 
     def url_for(self, meta: dict, image_path: Path, wait: bool = True) -> str | None:
         title = meta.get("title") or ""
@@ -201,7 +208,7 @@ class ArtworkResolver:
         if cached and now - cached[1] < UPLOAD_TTL:
             self.last_failure_kind = None
             return cached[0]
-        if now - self._last_fail < UPLOAD_RETRY:
+        if now - self._last_fail < self._gate_seconds:
             # network cooldown: a still-valid cached link may be served, but
             # no new upload attempts until the cooldown expires
             return cached[0] if cached and now - cached[1] < UPLOAD_TTL else None
@@ -211,6 +218,9 @@ class ArtworkResolver:
         if url:
             self._cache[key] = (url, time.monotonic())
             self.last_failure_kind = None
+            self.last_http_status = None
+            self._network_strikes = 0
+            self._gate_seconds = UPLOAD_RETRY
             return url
         kind = self.uploader.last_failure_kind
         self.last_failure_kind = kind
@@ -219,6 +229,13 @@ class ArtworkResolver:
         if kind == "network":
             # genuine server-side failure: arm the network cooldown;
             # placeholder-only states retry at the next heartbeat
+            self._network_strikes += 1
+            if self._network_strikes >= UPLOAD_GATE_EXTENDED_STRIKES and self._gate_seconds < UPLOAD_GATE_EXTENDED_SECONDS:
+                self._gate_seconds = UPLOAD_GATE_EXTENDED_SECONDS
+                log.warning(
+                    "cover art upload failing repeatedly (%d strikes); cooldown extended to %ds",
+                    self._network_strikes, int(UPLOAD_GATE_EXTENDED_SECONDS),
+                )
             self._last_fail = now
         return cached[0] if cached and now - cached[1] < UPLOAD_TTL else None
 
@@ -227,7 +244,9 @@ class ArtworkResolver:
         return [(f"{k[0][:20]}|{k[1][:20]}", now - t) for k, (_, t) in list(self._cache.items())]
 
     def retry_gate_remaining(self) -> float:
-        wait = UPLOAD_RETRY - (time.monotonic() - self._last_fail)
+        wait = self._gate_seconds - (time.monotonic() - self._last_fail)
+        if self._last_fail <= 0.0:
+            return 0.0
         return max(0.0, wait)
 
     def _lookup_itunes(self, title: str, artist: str) -> str | None:
