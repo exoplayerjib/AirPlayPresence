@@ -91,7 +91,7 @@ class PresenceBridge:
                     self.client_id,
                 )
                 return False
-            except PyPresenceException as exc:
+            except (PyPresenceException, OSError) as exc:
                 log.warning("Discord not reachable (%s), retrying in %.0fs", exc, backoff)
                 if self._stop_event.wait(backoff):
                     return False
@@ -204,6 +204,8 @@ class PresenceBridge:
             except (PipeClosed, ResponseTimeout, OSError) as exc:
                 log.warning("Discord connection lost (%s), reconnecting", exc)
                 self._reconnect()
+                if self._rpc is None:
+                    return False
                 continue
             except PyPresenceException as exc:
                 log.error("presence %s failed: %s", op, exc)
@@ -220,7 +222,7 @@ class PresenceBridge:
             try:
                 rpc = Presence(self.client_id)
                 rpc.connect()
-            except PyPresenceException as exc:
+            except (PyPresenceException, OSError) as exc:
                 log.warning("reconnect failed (%s), retrying in %.0fs", exc, backoff)
                 if self._stop_event.wait(backoff):
                     return
