@@ -151,6 +151,7 @@ Changes apply live and are saved to `~/.config/airplay-presence/config.json`.
 | `--dry-run` | — | Log payloads instead of talking to Discord |
 | `--verbose` | — | Debug logging (includes all uxplay output) |
 | `--no-tui` | TUI on | Plain log output instead of the curses terminal UI (automatic when stdout is not a terminal) |
+| `--log [FILE]` | `.run/airplay-presence.log` | Also write the full DEBUG-level log to a file: every Discord payload with timers, track updates, cover-art pipeline internals, all uxplay output, and uncaught exceptions (default when the flag is bare) |
 | `--no-uxplay` | — | Attach to an already-running uxplay instead of spawning one |
 
 ## Run at login (systemd user service)

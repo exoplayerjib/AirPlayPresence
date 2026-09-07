@@ -29,6 +29,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true", help="log payloads instead of talking to Discord")
     parser.add_argument("--no-tui", action="store_true", help="plain log output instead of the curses terminal UI (automatic when stdout is not a terminal)")
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument(
+        "--log",
+        nargs="?",
+        const=".run/airplay-presence.log",
+        default=None,
+        metavar="FILE",
+        help="also write the full DEBUG-level log (exceptions, every Discord payload, timers, all uxplay output) to this file (default when the flag is bare: .run/airplay-presence.log)",
+    )
     args = parser.parse_args()
     if not args.client_id and not args.dry_run:
         parser.error("--client-id (or DISCORD_CLIENT_ID) is required")

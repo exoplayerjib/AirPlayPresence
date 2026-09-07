@@ -177,6 +177,18 @@ class PresenceBridge:
                 return True
             try:
                 if op == "update":
+                    timer = ""
+                    if payload.get("start"):
+                        timer = f", start={payload['start']} end={payload.get('end', '?')}"
+                    log.debug(
+                        "discord: sending %s: name=%r details=%r state=%r large_text=%r "
+                        "large_image=%s status_display=%s (activity=%r%s)",
+                        op,
+                        payload.get("name"), payload.get("details"), payload.get("state"),
+                        payload.get("large_text"), payload.get("large_image"),
+                        payload.get("status_display_type"), payload.get("activity_type"),
+                        timer,
+                    )
                     self._rpc.update(**payload)
                 else:
                     self._rpc.clear()

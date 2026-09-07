@@ -6,6 +6,13 @@
 #   ./run.sh <CLIENT_ID>     - store the token in .client-id and run
 #   ./run.sh --client-id X   - same as above
 #   ./run.sh -- <extra args> - extra args are passed to the program
+# Useful extra args (see .venv/bin/python -m airplay_presence -h):
+#   --log [FILE]  also write the full DEBUG log (exceptions, Discord payloads,
+#                 timers, all uxplay output) to a file (default .run/airplay-presence.log)
+#
+# Examples:
+#   ./run.sh -- --log              # file log; value printed to the console at startup
+#   ./run.sh -- --log /tmp/dbg.log
 set -euo pipefail
 cd "$(dirname "$0")"
 

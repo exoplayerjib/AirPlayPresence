@@ -20,6 +20,7 @@ Project **AirPlayPresence** (GPLv3): a Python package at `src/airplay_presence/`
 - Syntax: `.venv/bin/python -m py_compile src/airplay_presence/*.py`
 - Behavior: `.venv/bin/python -m airplay_presence --dry-run` — logs payloads instead of talking to Discord (no client ID needed), still spawns uxplay and honors the send throttle.
 - TUI: under a pty (e.g. a Python `pty` subprocess harness) it renders the details view; `l` toggles the log side panel, `w` opens the web UI, `q` quits (exit code 0). `--no-tui` or a non-tty stdout keeps the classic stderr log.
+- `--log [FILE]` (default `.run/airplay-presence.log`) attaches a FileHandler at DEBUG on the root logger — the only place the full DEBUG stream (all uxplay noise, every Discord payload with timers, art pipeline internals) plus `threading`/`sys` excepthook dumps is recorded. Console/ring stays INFO unless `--verbose`; the root logger is ALWAYS DEBUG and each handler imposes its own level — don't set root back to INFO. The no-TUI path (and every run the TUI fails to boot) must go through the plain supervision loop in `main()` — that loop is the only thing keeping the process alive.
 - Without an AirPlay device: `--dry-run --no-uxplay` plus a hand-written `Key: value` meta file exercises watcher/payloads/UI. For seeks/timers, shim a fake `uxplay` on PATH that writes the meta file and prints the progress line (see below) — that runs the whole pipeline.
 
 ## Runtime prerequisites (not code)

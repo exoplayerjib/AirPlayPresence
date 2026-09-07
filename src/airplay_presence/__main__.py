@@ -29,6 +29,11 @@ log = logging.getLogger("airplay-presence")
 
 def _setup_logging(args, stdout_is_tty: bool) -> "RingBufferHandler | None":
     level = logging.DEBUG if args.verbose else logging.INFO
+    fmt = logging.Formatter("%(asctime)s %(levelname)-7s %(message)s", "%H:%M:%S")
+    root = logging.getLogger()
+    root.setLevel(logging.DEBUG)  # handlers enforce their own levels
+    root.handlers.clear()
+    ring = None
     if not args.no_tui and stdout_is_tty:
         try:
             import curses  # noqa: F401  (availability probe only)
@@ -38,14 +43,49 @@ def _setup_logging(args, stdout_is_tty: bool) -> "RingBufferHandler | None":
         from .ringlog import RingBufferHandler
 
         ring = RingBufferHandler(level=level)
-        logging.basicConfig(level=level, handlers=[ring], force=True)
-        return ring
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s %(levelname)-7s %(message)s",
-        datefmt="%H:%M:%S",
+        root.addHandler(ring)
+    else:
+        console = logging.StreamHandler(sys.stderr)
+        console.setLevel(level)
+        console.setFormatter(fmt)
+        root.addHandler(console)
+    _attach_log_file(args)
+    return ring
+
+
+def _attach_log_file(args) -> None:
+    """--log FILE: append everything (DEBUG) to a file — no details spared.
+
+    Goes beyond the console: full DEBUG fidelity (every uxplay line, every
+    Discord payload with timers, reconnects, art pipeline internals) plus
+    uncaught exceptions from any thread via excepthooks.
+    """
+    if not args.log:
+        return
+    path = Path(args.log).expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handler = logging.FileHandler(path, mode="a", encoding="utf-8")
+    handler.setLevel(logging.DEBUG)
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)-7s %(message)s", "%H:%M:%S"))
+    logging.getLogger().addHandler(handler)
+
+    def _thread_excepthook(exc) -> None:
+        log.error(
+            "uncaught exception in thread %s",
+            exc.thread.name if exc.thread is not None else "?",
+            exc_info=(exc.exc_type, exc.exc_value, exc.exc_traceback),
+        )
+
+    def _sys_excepthook(kind, value, tb) -> None:
+        log.critical("uncaught exception in main thread", exc_info=(kind, value, tb))
+
+    threading.excepthook = _thread_excepthook
+    sys.excepthook = _sys_excepthook
+    log.debug(
+        "session start: python %s on %s; dry_run=%s; tui=%s; args=%r",
+        sys.version.split()[0], sys.platform, args.dry_run, not args.no_tui, vars(args),
     )
-    return None
+    log.info("log file: %s (DEBUG level; exceptions and payloads included)", path)
 
 
 def main() -> int:
@@ -213,15 +253,14 @@ def main() -> int:
                     log.error("terminal UI crashed: %s", boot_err[-1], exc_info=boot_err[-1])
                 else:
                     log.warning("TUI could not start; falling back to plain log")
-        else:
-            while not stop_event.is_set():
-                time.sleep(0.5)
-                check_uxplay_alive()
-            if boot_err:
-                # TUI crashed mid-run (after a successful boot): the wrapper has
-                # already restored the terminal; mirror the error to stderr.
-                fallback_logging()
-                log.error("terminal UI crashed: %s", boot_err[-1], exc_info=boot_err[-1])
+        while not stop_event.is_set():
+            time.sleep(0.5)
+            check_uxplay_alive()
+        if boot_err:
+            # TUI crashed mid-run (after a successful boot): the wrapper has
+            # already restored the terminal; mirror the error to stderr.
+            fallback_logging()
+            log.error("terminal UI crashed: %s", boot_err[-1], exc_info=boot_err[-1])
     finally:
         debouncer.cancel()
         observer.stop()
