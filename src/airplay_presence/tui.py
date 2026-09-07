@@ -4,8 +4,8 @@ The main pane shows live details (track, exact payload keys, timing bar);
 the footer has three buttons — Log, Web UI, Quit — each clickable with a
 key alias (L / W / Q). Pressing Log (or L) opens the log side panel: a
 live, follow-aware scrolling view of the same lines the plain-log mode
-prints. The main thread runs this loop; all other threads emit through
-RingBufferHandler and stay untouched.
+prints. The curses loop runs on a dedicated daemon thread; all other
+threads emit through RingBufferHandler and stay untouched.
 """
 
 from __future__ import annotations
@@ -178,7 +178,7 @@ def run(stdscr, state, ring, extras, stop_event, ready=None) -> None:
                 stdscr.addnstr(rows - 1, x, lb, len(lb), C.A_REVERSE)
             except C.error:
                 pass
-            buttons.append((x, x + len(lb), lb[2].strip().lower()))
+            buttons.append((x, x + len(lb), lb.lstrip()[0].lower()))
             x += len(lb) + 2
         hint = "↑↓/jk scroll" if ui["mode"] == "details" else "G follow bottom"
         try:

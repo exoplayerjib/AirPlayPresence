@@ -85,7 +85,8 @@ class ImageUploader:
 
     def cache_info(self) -> list[tuple[str, float]]:
         now = time.monotonic()
-        return [(d[:12], now - t) for d, (_, t) in self._cache.items()]
+        # snapshot the dict: the worker thread mutates the cache while the TUI iterates
+        return [(d[:12], now - t) for d, (_, t) in list(self._cache.items())]
 
     def _upload(self, data: bytes) -> str | None:
         boundary = uuid.uuid4().hex
@@ -175,7 +176,7 @@ class ArtworkResolver:
 
     def cache_info(self) -> list[tuple[str, float]]:
         now = time.monotonic()
-        return [(f"{k[0][:20]}|{k[1][:20]}", now - t) for k, (_, t) in self._cache.items()]
+        return [(f"{k[0][:20]}|{k[1][:20]}", now - t) for k, (_, t) in list(self._cache.items())]
 
     def retry_gate_remaining(self) -> float:
         wait = UPLOAD_RETRY - (time.monotonic() - self._last_fail)
