@@ -54,9 +54,14 @@ class ImageUploader:
     def __init__(self, enabled: bool):
         self.enabled = enabled
         self._cache: dict[str, tuple[str, float]] = {}
+        # why the last url_for attempt failed: "no-file" (invalid/missing art
+        # file — retryable immediately) or "network" (litterbox refused —
+        # server-side, needs a cooldown)
+        self.last_failure_kind: str | None = None
 
     def url_for(self, path: Path, wait: bool = True) -> str | None:
         if not self.enabled:
+            self.last_failure_kind = "disabled"
             return None
         data = wait_valid_art(path) if wait else read_valid_art(path)
         if data is None:
@@ -73,13 +78,16 @@ class ImageUploader:
                         log.warning("cover art file %s is empty; retrying at the next heartbeat", path)
                 except OSError:
                     log.warning("cover art file %s absent; retrying at the next heartbeat", path)
+            self.last_failure_kind = "no-file"
             return None
+        self.last_failure_kind = None
         digest = hashlib.sha256(data).hexdigest()
         cached = self._cache.get(digest)
         if cached and time.monotonic() - cached[1] < UPLOAD_TTL:
             return cached[0]
         url = self._upload(data)
         if url:
+            self.last_failure_kind = None
             self._cache[digest] = (url, time.monotonic())
         return url
 
@@ -116,12 +124,15 @@ class ImageUploader:
                 url = response.read().decode("utf-8", "replace").strip()
         except (urllib.error.URLError, OSError) as exc:
             log.warning("cover art upload failed: %s", exc)
+            self.last_failure_kind = "network"
             return None
         if not url.startswith("https://"):
             log.warning("unexpected upload response: %r", url)
+            self.last_failure_kind = "network"
             return None
         if not self._verify(url):
             log.warning("uploaded cover art not reachable yet: %s", url)
+            self.last_failure_kind = "network"
             return None
         log.info("uploaded cover art: %s", url)
         return url
@@ -149,11 +160,22 @@ def norm_text(value: str) -> str:
 
 
 class ArtworkResolver:
+    """Resolves cover art per track, preferring iTunes (optional) then uploads.
+
+    Failure kinds are handled differently on purpose:
+    - "no-file": the -ca file is absent/empty/placeholder — no network abuse,
+      so the next heartbeat lookup may retry immediately (no gate armed).
+    - "network": litterbox (or iTunes) actively failed — arms the
+      UPLOAD_RETRY (60s) cooldown so heartbeats don't hammer a
+      rate-limiting endpoint.
+    """
+
     def __init__(self, uploader: ImageUploader, itunes: bool = False):
         self.uploader = uploader
         self.itunes = itunes
         self._cache: dict[tuple[str, str], tuple[str, float]] = {}
         self._last_fail = 0.0
+        self.last_failure_kind: str | None = None
 
     def url_for(self, meta: dict, image_path: Path, wait: bool = True) -> str | None:
         title = meta.get("title") or ""
@@ -162,16 +184,25 @@ class ArtworkResolver:
         now = time.monotonic()
         cached = self._cache.get(key)
         if cached and now - cached[1] < UPLOAD_TTL:
+            self.last_failure_kind = None
             return cached[0]
         if now - self._last_fail < UPLOAD_RETRY:
+            # network cooldown: a still-valid cached link may be served, but
+            # no new upload attempts until the cooldown expires
             return cached[0] if cached and now - cached[1] < UPLOAD_TTL else None
         url = self._lookup_itunes(title, artist) if self.itunes else None
         if not url:
             url = self.uploader.url_for(image_path, wait=wait)
         if url:
             self._cache[key] = (url, time.monotonic())
+            self.last_failure_kind = None
             return url
-        self._last_fail = now
+        kind = self.uploader.last_failure_kind
+        self.last_failure_kind = kind
+        if kind == "network":
+            # genuine server-side failure: arm the network cooldown;
+            # placeholder-only states retry at the next heartbeat
+            self._last_fail = now
         return cached[0] if cached and now - cached[1] < UPLOAD_TTL else None
 
     def cache_info(self) -> list[tuple[str, float]]:

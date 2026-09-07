@@ -130,7 +130,14 @@ def detail_lines(state, extras: dict, width: int) -> list[str]:
             wrap(digest, f"age {fmt_time(age)}, TTL left {fmt_time(max(0, 3600 - age))}")
     if resolver is not None:
         remaining = resolver.retry_gate_remaining()
-        wrap("retry gate", "open" if remaining <= 0 else f"cooldown {remaining:.0f}s")
+        kind = resolver.last_failure_kind
+        if kind == "network" and remaining > 0:
+            wrap("retry gate", f"cooldown {remaining:.0f}s (last failure: network)")
+        else:
+            reason = {"no-file": "no art file yet - next heartbeat retries", "disabled": "uploads off"}.get(kind)
+            wrap("retry gate", "open" if remaining <= 0 else f"cooldown {remaining:.0f}s")
+            if reason:
+                wrap("last failure", reason)
         for key, age in resolver.cache_info()[:4]:
             wrap(key, f"age {fmt_time(age)}")
     return lines
