@@ -131,13 +131,15 @@ def detail_lines(state, extras: dict, width: int) -> list[str]:
     if resolver is not None:
         remaining = resolver.retry_gate_remaining()
         kind = resolver.last_failure_kind
-        if kind == "network" and remaining > 0:
-            wrap("retry gate", f"cooldown {remaining:.0f}s (last failure: network)")
+        status = getattr(resolver, "last_http_status", None)
+        gate_text = {"no-file": "no art file yet - next heartbeat retries", "disabled": "uploads off"}.get(kind)
+        if remaining > 0 and kind == "network":
+            suffix = f" (HTTP {status})" if status else " (network)"
+            wrap("retry gate", f"cooldown {remaining:.0f}s{suffix}")
+        elif gate_text and remaining <= 0:
+            wrap("retry gate", f"open - {gate_text}")
         else:
-            reason = {"no-file": "no art file yet - next heartbeat retries", "disabled": "uploads off"}.get(kind)
             wrap("retry gate", "open" if remaining <= 0 else f"cooldown {remaining:.0f}s")
-            if reason:
-                wrap("last failure", reason)
         for key, age in resolver.cache_info()[:4]:
             wrap(key, f"age {fmt_time(age)}")
     return lines

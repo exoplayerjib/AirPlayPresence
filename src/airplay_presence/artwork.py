@@ -58,6 +58,7 @@ class ImageUploader:
         # file — retryable immediately) or "network" (litterbox refused —
         # server-side, needs a cooldown)
         self.last_failure_kind: str | None = None
+        self.last_http_status: int | None = None
 
     def url_for(self, path: Path, wait: bool = True) -> str | None:
         if not self.enabled:
@@ -81,6 +82,7 @@ class ImageUploader:
             self.last_failure_kind = "no-file"
             return None
         self.last_failure_kind = None
+        self.last_http_status = None
         digest = hashlib.sha256(data).hexdigest()
         cached = self._cache.get(digest)
         if cached and time.monotonic() - cached[1] < UPLOAD_TTL:
@@ -88,6 +90,7 @@ class ImageUploader:
         url = self._upload(data)
         if url:
             self.last_failure_kind = None
+            self.last_http_status = None
             self._cache[digest] = (url, time.monotonic())
         return url
 
@@ -122,6 +125,18 @@ class ImageUploader:
         try:
             with urllib.request.urlopen(request, timeout=30) as response:
                 url = response.read().decode("utf-8", "replace").strip()
+        except urllib.error.HTTPError as exc:
+            try:
+                body = exc.read(200).decode("utf-8", "replace").strip()
+            except Exception:
+                body = ""
+            self.last_http_status = exc.code
+            log.warning(
+                "cover art upload rejected: HTTP %s from litterbox%s",
+                exc.code, (f"; body: {body!r}" if body else " (no body)"),
+            )
+            self.last_failure_kind = "network"
+            return None
         except (urllib.error.URLError, OSError) as exc:
             log.warning("cover art upload failed: %s", exc)
             self.last_failure_kind = "network"
@@ -174,8 +189,8 @@ class ArtworkResolver:
         self.uploader = uploader
         self.itunes = itunes
         self._cache: dict[tuple[str, str], tuple[str, float]] = {}
-        self._last_fail = 0.0
         self.last_failure_kind: str | None = None
+        self._last_fail = 0.0
 
     def url_for(self, meta: dict, image_path: Path, wait: bool = True) -> str | None:
         title = meta.get("title") or ""
@@ -199,6 +214,8 @@ class ArtworkResolver:
             return url
         kind = self.uploader.last_failure_kind
         self.last_failure_kind = kind
+        # mirror the HTTP status for the TUI gate line
+        self.last_http_status = self.uploader.last_http_status
         if kind == "network":
             # genuine server-side failure: arm the network cooldown;
             # placeholder-only states retry at the next heartbeat
