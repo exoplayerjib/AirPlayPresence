@@ -106,7 +106,15 @@ def main() -> int:
         reader.start()
         time.sleep(1.0)
         if proc.poll() is not None:
-            log.error("uxplay exited immediately; recent output:\n%s", "\n".join(tail) or "(none)")
+            recent = "\n".join(tail) or "(none)"
+            message = f"uxplay exited immediately; recent output:\n{recent}"
+            if ring is not None:
+                try:
+                    print(message, file=sys.stderr)
+                except BrokenPipeError:
+                    pass
+            else:
+                log.error(message)
             return 1
         log.info("uxplay running (pid %d)", proc.pid)
         if ui_server is not None and not args.no_browser:
@@ -158,7 +166,9 @@ def main() -> int:
 
     try:
         tui_active = False
-        if ring is not None and not failed.is_set() and not crashed.is_set():
+        boot_err: list[Exception] = []
+        try_tui = ring is not None and not failed.is_set() and not crashed.is_set()
+        if try_tui:
             tui_extras = {
                 "uxplay": (proc, uxplay_dead) if proc is not None else None,
                 "bridge": bridge,
@@ -171,7 +181,6 @@ def main() -> int:
                 "open_webui": open_webui,
             }
             ready = threading.Event()
-            boot_err = []
 
             def _run_tui() -> None:
                 import curses
@@ -188,19 +197,31 @@ def main() -> int:
             tui_thread = threading.Thread(target=_run_tui, name="tui", daemon=True)
             tui_thread.start()
             ready.wait(timeout=3.0)
-            if ready.is_set():
-                tui_active = True
-                while not stop_event.is_set():
-                    time.sleep(0.5)
-                    check_uxplay_alive()
-            else:
-                reason = boot_err[0].__class__.__name__ if boot_err else "no output"
-                fallback_logging()
-                log.warning("TUI could not start (%s); falling back to plain log", reason)
+            tui_active = ready.is_set()
         if not tui_active:
+            # No TUI this run (bridge failed pre-boot, boot timeout, or crash):
+            # the ring buffer would swallow everything — re-install stderr.
+            if ring is not None:
+                fallback_logging()
+                if not try_tui:
+                    # Stopping events were set before any TUI attempt (e.g. a
+                    # rejected Discord client ID) and the diagnosis has been
+                    # piling up in the ring buffer — surface it on stderr.
+                    for line in ring.snapshot():
+                        print(line.formatted, file=sys.stderr)
+                elif boot_err:
+                    log.error("terminal UI crashed: %s", boot_err[-1], exc_info=boot_err[-1])
+                else:
+                    log.warning("TUI could not start; falling back to plain log")
+        else:
             while not stop_event.is_set():
                 time.sleep(0.5)
                 check_uxplay_alive()
+            if boot_err:
+                # TUI crashed mid-run (after a successful boot): the wrapper has
+                # already restored the terminal; mirror the error to stderr.
+                fallback_logging()
+                log.error("terminal UI crashed: %s", boot_err[-1], exc_info=boot_err[-1])
     finally:
         debouncer.cancel()
         observer.stop()
@@ -217,7 +238,7 @@ def main() -> int:
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait()
-    return 1 if (failed.is_set() or crashed.is_set()) else 0
+    return 1 if (failed.is_set() or crashed.is_set() or boot_err) else 0
 
 
 if __name__ == "__main__":
