@@ -2,8 +2,8 @@
 # Launch AirPlayPresence with default parameters.
 #
 # Usage:
-#   ./run.sh                 - use the token stored in client-id (repo root)
-#   ./run.sh <CLIENT_ID>     - store the token in client-id and run
+#   ./run.sh                 - use the token stored in .client-id (repo root)
+#   ./run.sh <CLIENT_ID>     - store the token in .client-id and run
 #   ./run.sh --client-id X   - same as above
 #   ./run.sh -- <extra args> - extra args are passed to the program
 set -euo pipefail

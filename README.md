@@ -76,7 +76,7 @@ cd AirPlayPresence
 ./run.sh YOUR_APPLICATION_ID
 ```
 
-`run.sh` creates the virtualenv, installs the package (deps come from `pyproject.toml`), stores the token in `client-id` (repo-local, gitignored, mode 600), and launches the app. Next time just:
+`run.sh` creates the virtualenv, installs the package (deps come from `pyproject.toml`), stores the token in `.client-id` (repo-local, gitignored, mode 600), and launches the app. Next time just:
 
 ```bash
 ./run.sh                     # uses the stored token
@@ -95,7 +95,7 @@ No bot, no OAuth, no token needed.
 ## Run
 
 ```bash
-./run.sh                # token from client-id / $DISCORD_CLIENT_ID, default parameters
+./run.sh                # token from .client-id / $DISCORD_CLIENT_ID, default parameters
 ```
 
 (or directly: `.venv/bin/python -m airplay_presence --client-id YOUR_APPLICATION_ID`)

@@ -2,7 +2,7 @@
 
 ## What this is
 
-Project **AirPlayPresence** (GPLv3): a Python package at `src/airplay_presence/` that spawns `uxplay` itself as a headless audio-only AirPlay server (`-p`, `-vs 0`, `-md`, `-ca`), watches the metadata/cover files uxplay writes, and feeds four outputs: Discord Rich Presence (pypresence IPC, with elapsed/remaining timers), an MPRIS player on D-Bus, a local web UI (`/`, `/state`, `/art`, `/config` on `127.0.0.1:8080`), and a curses terminal UI (details pane + toggleable log side panel; `--no-tui` restores the plain log). `run.sh` at the repo root launches everything with the default parameters; it takes the Discord client ID as an argument (storing it in the gitignored repo-local `client-id` file, mode 600) or falls back through `$DISCORD_CLIENT_ID` to the stored file, and creates/validates the venv itself. No test suite, no lint/CI — don't invent commands for these.
+Project **AirPlayPresence** (GPLv3): a Python package at `src/airplay_presence/` that spawns `uxplay` itself as a headless audio-only AirPlay server (`-p`, `-vs 0`, `-md`, `-ca`), watches the metadata/cover files uxplay writes, and feeds four outputs: Discord Rich Presence (pypresence IPC, with elapsed/remaining timers), an MPRIS player on D-Bus, a local web UI (`/`, `/state`, `/art`, `/config` on `127.0.0.1:8080`), and a curses terminal UI (details pane + toggleable log side panel; `--no-tui` restores the plain log). `run.sh` at the repo root launches everything with the default parameters; it takes the Discord client ID as an argument (storing it in the gitignored repo-local `.client-id` file, mode 600) or falls back through `$DISCORD_CLIENT_ID` to the stored file, and creates/validates the venv itself. No test suite, no lint/CI — don't invent commands for these.
 
 ## Layout
 
@@ -24,7 +24,7 @@ Project **AirPlayPresence** (GPLv3): a Python package at `src/airplay_presence/`
 
 ## Runtime prerequisites (not code)
 
-- `uxplay` binary on PATH; Discord desktop app running; client ID via `--client-id`, `$DISCORD_CLIENT_ID`, or the `client-id` file (run.sh wires the precedence); a D-Bus session bus for MPRIS (missing → logged and disabled).
+- `uxplay` binary on PATH; Discord desktop app running; client ID via `--client-id`, `$DISCORD_CLIENT_ID`, or the `.client-id` file (run.sh wires the precedence); a D-Bus session bus for MPRIS (missing → logged and disabled).
 - AirPlay ports must be open (UDP 5353, TCP 7100/7000/7001, UDP 6000/6001/7011 — see README firewall section).
 
 ## Non-obvious constraints when editing
