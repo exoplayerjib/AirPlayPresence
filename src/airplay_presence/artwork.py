@@ -16,8 +16,8 @@ from pathlib import Path
 from .constants import (
     MIN_ART_BYTES, ART_SETTLE_TIMEOUT, UPLOAD_EXPIRY, UPLOAD_GATE_EXTENDED_SECONDS,
     UPLOAD_GATE_EXTENDED_STRIKES, UPLOAD_HTTP_FAILURE_BODY_CAPTURE, UPLOAD_HTTP_RETRIES,
-    UPLOAD_HTTP_RETRY_BACKOFF, UPLOAD_RETRY, UPLOAD_TTL, UPLOAD_URL, UPLOAD_USER_AGENT,
-    UPLOAD_VERIFY_TIMEOUT,
+    UPLOAD_HTTP_RETRY_BACKOFF, UPLOAD_RETRY, UPLOAD_RETRY_TRANSIENT, UPLOAD_TTL,
+    UPLOAD_URL, UPLOAD_USER_AGENT, UPLOAD_VERIFY_TIMEOUT,
 )
 
 
@@ -205,9 +205,11 @@ class ArtworkResolver:
     Failure kinds are handled differently on purpose:
     - "no-file": the -ca file is absent/empty/placeholder — no network abuse,
       so the next heartbeat lookup may retry immediately (no gate armed).
-    - "network": litterbox (or iTunes) actively failed — arms the
-      UPLOAD_RETRY (60s) cooldown so heartbeats don't hammer a
-      rate-limiting endpoint.
+    - "network": litterbox (or iTunes) actively failed — arms a cooldown
+      split by failure class: 4xx refusals (412 rate-limit / 403 forbidden)
+      get the full UPLOAD_RETRY (60s); 5xx flakes and connection errors
+      get UPLOAD_RETRY_TRANSIENT (20s). Reaching 3 strikes extends either
+      class to the 300s extended cooldown.
     """
 
     def __init__(self, uploader: ImageUploader, itunes: bool = False):
@@ -248,8 +250,14 @@ class ArtworkResolver:
         self.last_http_status = self.uploader.last_http_status
         if kind == "network":
             # genuine server-side failure: arm the network cooldown;
-            # placeholder-only states retry at the next heartbeat
+            # placeholder-only states retry at the next heartbeat.
+            # 4xx refusals (rate-limited/forbidden) keep the long backoff —
+            # hammering them prolongs the block; 5xx flakes and connection
+            # errors are transient and retry sooner
             self._network_strikes += 1
+            status = self.uploader.last_http_status
+            refusal = status is not None and status < 500
+            self._gate_seconds = UPLOAD_RETRY if refusal else UPLOAD_RETRY_TRANSIENT
             if self._network_strikes >= UPLOAD_GATE_EXTENDED_STRIKES and self._gate_seconds < UPLOAD_GATE_EXTENDED_SECONDS:
                 self._gate_seconds = UPLOAD_GATE_EXTENDED_SECONDS
                 log.warning(
