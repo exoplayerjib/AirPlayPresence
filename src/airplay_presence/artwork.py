@@ -15,8 +15,9 @@ from pathlib import Path
 
 from .constants import (
     MIN_ART_BYTES, ART_SETTLE_TIMEOUT, UPLOAD_EXPIRY, UPLOAD_GATE_EXTENDED_SECONDS,
-    UPLOAD_GATE_EXTENDED_STRIKES, UPLOAD_HTTP_FAILURE_BODY_CAPTURE, UPLOAD_RETRY,
-    UPLOAD_TTL, UPLOAD_URL, UPLOAD_USER_AGENT, UPLOAD_VERIFY_TIMEOUT,
+    UPLOAD_GATE_EXTENDED_STRIKES, UPLOAD_HTTP_FAILURE_BODY_CAPTURE, UPLOAD_HTTP_RETRIES,
+    UPLOAD_HTTP_RETRY_BACKOFF, UPLOAD_RETRY, UPLOAD_TTL, UPLOAD_URL, UPLOAD_USER_AGENT,
+    UPLOAD_VERIFY_TIMEOUT,
 )
 
 
@@ -114,48 +115,67 @@ class ImageUploader:
             data,
             f"\r\n--{boundary}--\r\n".encode(),
         ))
-        request = urllib.request.Request(
-            UPLOAD_URL,
-            data=body,
-            headers={
-                "Content-Type": f"multipart/form-data; boundary={boundary}",
-                "User-Agent": UPLOAD_USER_AGENT,
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "en-US,en;q=0.9",
-                "Referer": "https://litterbox.catbox.moe/",
-                "Origin": "https://litterbox.catbox.moe",
-            },
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=30) as response:
-                url = response.read().decode("utf-8", "replace").strip()
-        except urllib.error.HTTPError as exc:
-            try:
-                body = exc.read(UPLOAD_HTTP_FAILURE_BODY_CAPTURE).decode("utf-8", "replace").strip()
-            except Exception:
-                body = ""
-            self.last_http_status = exc.code
-            self.last_failure_kind = "network"
-            log.warning(
-                "cover art upload rejected: HTTP %s from litterbox%s",
-                exc.code, (f"; body: {body!r}" if body else " (no body)"),
+        attempts = UPLOAD_HTTP_RETRIES + 1
+        for attempt in range(1, attempts + 1):
+            request = urllib.request.Request(
+                UPLOAD_URL,
+                data=body,
+                headers={
+                    "Content-Type": f"multipart/form-data; boundary={boundary}",
+                    "User-Agent": UPLOAD_USER_AGENT,
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Referer": "https://litterbox.catbox.moe/",
+                    "Origin": "https://litterbox.catbox.moe",
+                },
+                method="POST",
             )
-            return None
-        except (urllib.error.URLError, OSError) as exc:
-            log.warning("cover art upload failed: %s", exc)
-            self.last_failure_kind = "network"
-            return None
-        if not url.startswith("https://"):
-            log.warning("unexpected upload response: %r", url)
-            self.last_failure_kind = "network"
-            return None
-        if not self._verify(url):
-            log.warning("uploaded cover art not reachable yet: %s", url)
-            self.last_failure_kind = "network"
-            return None
-        log.info("uploaded cover art: %s", url)
-        return url
+            try:
+                with urllib.request.urlopen(request, timeout=30) as response:
+                    url = response.read().decode("utf-8", "replace").strip()
+            except urllib.error.HTTPError as exc:
+                try:
+                    err_body = exc.read(UPLOAD_HTTP_FAILURE_BODY_CAPTURE).decode("utf-8", "replace").strip()
+                except Exception:
+                    err_body = ""
+                if exc.code < 500 or attempt >= attempts:
+                    self.last_http_status = exc.code
+                    self.last_failure_kind = "network"
+                    log.warning(
+                        "cover art upload rejected: HTTP %s from litterbox%s",
+                        exc.code, (f"; body: {err_body!r}" if err_body else " (no body)"),
+                    )
+                    return None
+                # transient server-side flake (litterbox 500s on valid uploads):
+                # back off briefly and retry, 4xx still fails fast
+                self._retry_pause(attempt, f"HTTP {exc.code}")
+                continue
+            except (urllib.error.URLError, OSError) as exc:
+                if attempt >= attempts:
+                    log.warning("cover art upload failed: %s", exc)
+                    self.last_failure_kind = "network"
+                    return None
+                self._retry_pause(attempt, str(exc))
+                continue
+            if not url.startswith("https://"):
+                log.warning("unexpected upload response: %r", url)
+                self.last_failure_kind = "network"
+                return None
+            if not self._verify(url):
+                log.warning("uploaded cover art not reachable yet: %s", url)
+                self.last_failure_kind = "network"
+                return None
+            log.info("uploaded cover art: %s", url)
+            return url
+        return None
+
+    def _retry_pause(self, attempt: int, cause: str) -> None:
+        delay = UPLOAD_HTTP_RETRY_BACKOFF * attempt
+        log.info(
+            "litterbox upload failed (%s), retrying (%d/%d) in %gs",
+            cause, attempt, UPLOAD_HTTP_RETRIES, delay,
+        )
+        time.sleep(delay)
 
     def _verify(self, url: str) -> bool:
         deadline = time.monotonic() + UPLOAD_VERIFY_TIMEOUT
