@@ -14,7 +14,7 @@ from pathlib import Path
 from watchdog.observers import Observer
 
 from .ringlog import RingBufferHandler
-from .artwork import ArtworkResolver, ImageUploader
+from .artwork import ArtWorker, ArtworkResolver, ImageUploader
 from .cli import parse_args
 from .config import PresenceConfig
 from .mpris import MPRIS_AVAILABLE, MprisServer
@@ -115,13 +115,13 @@ def main() -> int:
     state = AppState(progress)
     config = PresenceConfig(config_path)
     bridge = PresenceBridge(args.client_id or "", args.min_interval, args.dry_run)
-    artwork = ArtworkResolver(ImageUploader(not args.no_image), itunes=args.itunes_art)
-    jobs: "queue.Queue[str]" = queue.Queue()
+    jobs: "queue.Queue[str | tuple]" = queue.Queue()
     stop_event = threading.Event()
     failed = threading.Event()
     crashed = threading.Event()
-    misses = [0]
     debouncer = Debouncer(args.debounce, jobs.put)
+    artwork = ArtworkResolver(ImageUploader(not args.no_image), itunes=args.itunes_art)
+    art_worker = ArtWorker(artwork, image_path, jobs.put, stop_event)
 
     ui_server = None
     if not args.no_ui:
@@ -162,9 +162,10 @@ def main() -> int:
             threading.Thread(target=webbrowser.open, args=(url,), daemon=True).start()
 
     bridge.start(failed, stop_event)
+    art_worker.start()
     worker = threading.Thread(
         target=run_worker,
-        args=(meta_path, image_path, bridge, artwork, config, jobs, stop_event, state, progress, misses, mpris, debouncer),
+        args=(meta_path, bridge, artwork, config, jobs, stop_event, state, progress, mpris, debouncer, art_worker),
         daemon=True,
     )
     worker.start()
@@ -267,6 +268,7 @@ def main() -> int:
         observer.join(timeout=5)
         stop_event.set()
         worker.join(timeout=5)
+        art_worker.join(timeout=5)
         if ui_server is not None:
             ui_server.shutdown()
             ui_server.server_close()

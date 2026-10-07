@@ -4,7 +4,9 @@ import logging
 import hashlib
 import itertools
 import json
+import queue
 import re
+import threading
 import time
 import unicodedata
 import urllib.error
@@ -56,6 +58,7 @@ class ImageUploader:
     def __init__(self, enabled: bool):
         self.enabled = enabled
         self._cache: dict[str, tuple[str, float]] = {}
+        self._lock = threading.Lock()
         # why the last url_for attempt failed: "no-file" (invalid/missing art
         # file — retryable immediately) or "network" (litterbox refused —
         # server-side, needs a cooldown)
@@ -86,20 +89,24 @@ class ImageUploader:
         self.last_failure_kind = None
         self.last_http_status = None
         digest = hashlib.sha256(data).hexdigest()
-        cached = self._cache.get(digest)
+        with self._lock:
+            cached = self._cache.get(digest)
         if cached and time.monotonic() - cached[1] < UPLOAD_TTL:
             return cached[0]
         url = self._upload(data)
         if url:
             self.last_failure_kind = None
             self.last_http_status = None
-            self._cache[digest] = (url, time.monotonic())
+            with self._lock:
+                self._cache[digest] = (url, time.monotonic())
         return url
 
     def cache_info(self) -> list[tuple[str, float]]:
         now = time.monotonic()
-        # snapshot the dict: the worker thread mutates the cache while the TUI iterates
-        return [(d[:12], now - t) for d, (_, t) in list(self._cache.items())]
+        # snapshot the dict under the lock: the art thread mutates the cache
+        # (uploads) while the TUI iterates it
+        with self._lock:
+            return [(d[:12], now - t) for d, (_, t) in self._cache.items()]
 
     def _upload(self, data: bytes) -> str | None:
         boundary = uuid.uuid4().hex
@@ -216,17 +223,30 @@ class ArtworkResolver:
         self.uploader = uploader
         self.itunes = itunes
         self._cache: dict[tuple[str, str], tuple[str, float]] = {}
+        self._lock = threading.Lock()
         self.last_failure_kind: str | None = None
         self._last_fail = 0.0
         self._gate_seconds = UPLOAD_RETRY
         self._network_strikes = 0
+
+    def cached_url(self, meta: dict) -> str | None:
+        """Cache-only lookup for the worker loop: no file reads, no network,
+        no gate arming — safe to call any time; the art thread owns the
+        blocking resolution."""
+        key = (meta.get("title") or "", meta.get("artist") or "")
+        with self._lock:
+            cached = self._cache.get(key)
+        if cached and time.monotonic() - cached[1] < UPLOAD_TTL:
+            return cached[0]
+        return None
 
     def url_for(self, meta: dict, image_path: Path, wait: bool = True) -> str | None:
         title = meta.get("title") or ""
         artist = meta.get("artist") or ""
         key = (title, artist)
         now = time.monotonic()
-        cached = self._cache.get(key)
+        with self._lock:
+            cached = self._cache.get(key)
         if cached and now - cached[1] < UPLOAD_TTL:
             self.last_failure_kind = None
             return cached[0]
@@ -238,7 +258,8 @@ class ArtworkResolver:
         if not url:
             url = self.uploader.url_for(image_path, wait=wait)
         if url:
-            self._cache[key] = (url, time.monotonic())
+            with self._lock:
+                self._cache[key] = (url, time.monotonic())
             self.last_failure_kind = None
             self.last_http_status = None
             self._network_strikes = 0
@@ -246,8 +267,7 @@ class ArtworkResolver:
             return url
         kind = self.uploader.last_failure_kind
         self.last_failure_kind = kind
-        # mirror the HTTP status for the TUI gate line
-        self.last_http_status = self.uploader.last_http_status
+        self.last_http_status = self.uploader.last_http_status if kind == "network" else None
         if kind == "network":
             # genuine server-side failure: arm the network cooldown;
             # placeholder-only states retry at the next heartbeat.
@@ -265,16 +285,20 @@ class ArtworkResolver:
                     self._network_strikes, int(UPLOAD_GATE_EXTENDED_SECONDS),
                 )
             self._last_fail = now
+        with self._lock:
+            cached = self._cache.get(key)
         return cached[0] if cached and now - cached[1] < UPLOAD_TTL else None
 
     def cache_info(self) -> list[tuple[str, float]]:
         now = time.monotonic()
-        return [(f"{k[0][:20]}|{k[1][:20]}", now - t) for k, (_, t) in list(self._cache.items())]
+        with self._lock:
+            return [(f"{k[0][:20]}|{k[1][:20]}", now - t) for k, (_, t) in self._cache.items()]
 
     def retry_gate_remaining(self) -> float:
-        wait = self._gate_seconds - (time.monotonic() - self._last_fail)
-        if self._last_fail <= 0.0:
-            return 0.0
+        with self._lock:
+            if self._last_fail <= 0.0:
+                return 0.0
+            wait = self._gate_seconds - (time.monotonic() - self._last_fail)
         return max(0.0, wait)
 
     def _lookup_itunes(self, title: str, artist: str) -> str | None:
@@ -307,3 +331,58 @@ class ArtworkResolver:
                 return url
         log.info("no iTunes match for %r, falling back to litterbox upload", title)
         return None
+
+
+class ArtWorker:
+    """Dedicated thread for all blocking artwork work: art-settle polling,
+    uploads, verification, gate backoff.
+
+    The worker loop stays free: it submits requests via request() (a
+    cache-only lookup decides whether one is needed) and receives results
+    as ("art", (title, artist), url) jobs in its queue. Result application —
+    MPRIS republish, payload rebuild, Discord send — stays on the worker
+    thread; only the network waits live here."""
+
+    def __init__(
+        self,
+        resolver: ArtworkResolver,
+        image_path: Path,
+        submit,
+        stop_event: threading.Event,
+    ) -> None:
+        self._resolver = resolver
+        self._image_path = image_path
+        self._submit = submit
+        self._stop_event = stop_event
+        self._requests: "queue.Queue[dict]" = queue.Queue()
+        self._thread: threading.Thread | None = None
+
+    def request(self, meta: dict) -> None:
+        self._requests.put(dict(meta))
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._run, name="artwork", daemon=True)
+        self._thread.start()
+
+    def join(self, timeout: float = 5.0) -> None:
+        if self._thread is not None:
+            self._thread.join(timeout=timeout)
+
+    def _run(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                meta = self._requests.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            # drain to the newest request: only the latest track matters
+            while True:
+                try:
+                    meta = self._requests.get_nowait()
+                except queue.Empty:
+                    break
+            try:
+                url = self._resolver.url_for(meta, self._image_path, wait=True)
+            except Exception:
+                log.exception("artwork resolution failed")
+                url = None
+            self._submit(("art", (meta.get("title") or "", meta.get("artist") or ""), url))

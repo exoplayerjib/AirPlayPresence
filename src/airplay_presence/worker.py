@@ -8,10 +8,10 @@ from pathlib import Path
 
 from watchdog.events import FileSystemEventHandler
 
-from .artwork import ArtworkResolver, fresh_image_url
+from .artwork import ArtworkResolver, ArtWorker, fresh_image_url
 from .config import PresenceConfig
 from .constants import (
-    HEARTBEAT_QUIET, PAUSE_TIMEOUT, RESUME_THROTTLE, SEEK_BASE_MAX_AGE,
+    HEARTBEAT_QUIET, PAUSE_TIMEOUT, PROGRESS_WAIT, RESUME_THROTTLE, SEEK_BASE_MAX_AGE,
     STATUS_DISPLAY_MAP,
 )
 from .mpris import MprisServer
@@ -79,35 +79,34 @@ def wait_for_progress(
     progress: ProgressState,
     changed_at: float | None,
     prior: tuple[float, float] | None,
-    misses: list[int],
 ) -> tuple[float, float] | None:
     if changed_at is None:
         return progress.snapshot()
-    deadline = time.monotonic() + 3.0
+    # short grace wait: the new track's first progress print usually lands
+    # within ~1s of the metadata event (the \r-trap holds the old track's
+    # final print until the next stdout byte). If it hasn't arrived by the
+    # deadline, publish timer-less — the idle tick's timer_pending branch
+    # attaches the timer when it lands; the worker never blocks longer.
+    deadline = time.monotonic() + PROGRESS_WAIT
     while time.monotonic() < deadline:
         cur = progress.snapshot(min_at=changed_at, raw=True)
         if cur is not None and new_track_signature(cur, prior):
             return progress.snapshot(min_at=changed_at)
         time.sleep(0.2)
-    if prior is None:
-        misses[0] += 1
-        if misses[0] >= 3:
-            log.info("no playback progress available, not waiting for it anymore")
     return None
 
 def run_worker(
     meta_path: Path,
-    image_path: Path,
     bridge: PresenceBridge,
     artwork: ArtworkResolver,
     config: PresenceConfig,
-    jobs: "queue.Queue[str]",
+    jobs: "queue.Queue[str | tuple]",
     stop_event: threading.Event,
     state: AppState,
     progress: ProgressState,
-    misses: list[int],
     mpris: "MprisServer | None",
     debouncer: Debouncer,
+    art_worker: ArtWorker,
 ) -> None:
     def identity_of(meta: dict) -> tuple[str, str, str]:
         return (meta.get("title") or "", meta.get("artist") or "", meta.get("album") or "")
@@ -121,14 +120,19 @@ def run_worker(
         if wait_progress:
             prior = progress.seek_base(SEEK_BASE_MAX_AGE) or progress.snapshot(raw=True)
             changed_at = time.monotonic() if changed else None
-            progress_snap = wait_for_progress(progress, changed_at, prior, misses)
+            progress_snap = wait_for_progress(progress, changed_at, prior)
             timer_pending = progress_snap is None
             pending_prior = prior if timer_pending else None
         else:
             progress_snap = progress.snapshot()
             timer_pending = progress_snap is None
             pending_prior = None
-        image_url = artwork.url_for(meta, image_path)
+        # art never blocks the publish: serve a cached link if we have one,
+        # otherwise send without art and let the art thread resolve async —
+        # its result arrives as an ("art", key, url) job
+        image_url = artwork.cached_url(meta)
+        if image_url is None:
+            art_worker.request(meta)
         state.set_now_playing(meta, image_url)
         current_meta = meta
         current_image = image_url
@@ -172,6 +176,31 @@ def run_worker(
                 mpris.publish(None, None, paused=False)
         last_identity = None
 
+    def apply_art(key: tuple[str, str], url: str | None) -> None:
+        """Attach an asynchronously resolved art URL to the current track.
+
+        Runs on the worker thread as a job: all presence/MPRIS state stays
+        single-threaded; the art thread only did the network waiting."""
+        nonlocal current_image, last_payload
+        if not active or current_meta is None:
+            return
+        if (current_meta.get("title") or "", current_meta.get("artist") or "") != key:
+            return  # stale result for a track that is no longer current
+        if not url or url == current_image:
+            return
+        current_image = url
+        state.set_now_playing(current_meta, url)
+        if mpris is not None:
+            mpris.publish(current_meta, url, paused=False)
+        if last_payload is None:
+            return
+        payload = dict(last_payload)
+        payload["large_image"] = fresh_image_url(url)
+        log.info("cover art attached: %s", url)
+        bridge.update(payload, throttle=RESUME_THROTTLE, force=True)
+        last_payload = payload
+        state.set_payload(payload)
+
     last_identity: tuple[str, str, str] | None = None
     last_seen_position: float | None = None
     last_seen_seek = 0
@@ -190,37 +219,59 @@ def run_worker(
         if mapping.get("status_rotation") and order:
             return order[rot_idx % len(order)]
         return mapping.get("status_display") or "state"
-    while not stop_event.is_set():
-        try:
-            job = jobs.get(timeout=0.5)
-        except queue.Empty:
-            job = None
-        else:
-            try:
-                while True:
-                    job = jobs.get_nowait()
-            except queue.Empty:
-                pass
+
+    def handle_job(job: "str | tuple") -> None:
+        nonlocal last_job_at, last_seen_seek, active
+        if isinstance(job, tuple):
+            _, key, url = job
+            apply_art(key, url)
+            return
         if job == "clear":
             log.info("metadata file gone or empty, clearing presence")
             clear_presence(paused=False)
             active = False
-            continue
+            return
         if job in ("update", "refresh"):
             last_job_at = time.monotonic()
             if not meta_path.exists():
-                continue
+                return
             meta = parse_metadata(meta_path)
             if meta is None:
-                continue
+                return
             if not meta.get("title"):
                 log.info("no track in metadata, clearing presence")
                 clear_presence(paused=False)
                 active = False
-                continue
-            send_update(meta, wait_progress=(job == "update"), throttle=(RESUME_THROTTLE if job == "refresh" else None))
+                return
+            send_update(
+                meta,
+                wait_progress=(job == "update"),
+                throttle=(RESUME_THROTTLE if job == "refresh" else None),
+            )
             last_seen_seek = progress.seek_seq
             active = True
+
+    while not stop_event.is_set():
+        try:
+            first = jobs.get(timeout=0.5)
+        except queue.Empty:
+            first = None
+        if first is not None:
+            batch: "list[str | tuple]" = [first]
+            try:
+                while True:
+                    nxt = jobs.get_nowait()
+                    # consecutive plain jobs collapse into the newest (burst
+                    # coalescing), but an art result never swallows a pending
+                    # update/clear — dropping that would skip a publish
+                    if isinstance(nxt, str) and isinstance(batch[-1], str):
+                        batch[-1] = nxt
+                    else:
+                        batch.append(nxt)
+            except queue.Empty:
+                pass
+            for job in batch:
+                handle_job(job)
             continue
         if active and progress.stale(PAUSE_TIMEOUT):
             log.info("playback paused or stream ended, clearing presence")
@@ -250,7 +301,10 @@ def run_worker(
         ):
             payload = dict(last_payload)
             if current_meta is not None:
-                image_url = artwork.url_for(current_meta, image_path, wait=False)
+                # non-blocking cache lookup: a missing/expired link no longer
+                # uploads inline (that could stall the worker for the whole
+                # upload+verify chain) — the art thread re-resolves instead
+                image_url = artwork.cached_url(current_meta)
                 if image_url != current_image:
                     current_image = image_url
                     if mpris is not None:
@@ -259,6 +313,7 @@ def run_worker(
                     payload["large_image"] = fresh_image_url(image_url)
                 else:
                     payload.pop("large_image", None)
+                    art_worker.request(current_meta)
             mapping = config.get()
             if mapping.get("status_rotation"):
                 order = mapping.get("status_rotation_order") or []

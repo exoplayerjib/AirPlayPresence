@@ -4,7 +4,7 @@ import logging
 import threading
 import time
 
-from .constants import SEEK_BACKWARD_JUMP, SEEK_FORWARD_JUMP
+from .constants import SEEK_BACKWARD_JUMP, SEEK_BASE_MAX_AGE, SEEK_FORWARD_JUMP
 
 
 log = logging.getLogger("airplay-presence")
@@ -18,22 +18,55 @@ class ProgressState:
         self._last_raw_position: float | None = None
         self._seek_base: tuple[float, float] | None = None
         self._seek_base_at = 0.0
+        # two-stage seek confirmation: a jump print only arms a candidate;
+        # seek_seq bumps when the NEXT print continues forward from it. A
+        # print returning to the pre-jump timeline is jitter, never a seek —
+        # a counter oscillating near 0 used to bump seek_seq every other
+        # print and the seek re-sends reset Discord's elapsed timer forever.
+        self._pending_jump: tuple[float, float, float] | None = None  # (pos, dur, at)
         self.ever = False
         self.seek_seq = 0
 
+    def _continues_seek_base(self, position: float, now: float) -> bool:
+        """Does this print continue the pre-jump timeline (a jitter blip)?"""
+        if self._seek_base is None or self._seek_base_at <= 0.0:
+            return False
+        base_pos = self._seek_base[0]
+        expected = base_pos + (now - self._seek_base_at)
+        return base_pos - SEEK_BACKWARD_JUMP <= position <= expected + SEEK_FORWARD_JUMP
+
     def set(self, position: float, duration: float) -> None:
         with self._lock:
-            if self._last_raw_position is not None and (
-                position > self._last_raw_position + SEEK_FORWARD_JUMP
-                or position < self._last_raw_position - SEEK_BACKWARD_JUMP
-            ):
-                self.seek_seq += 1
-                self._seek_base = (self._position, self._duration)
-                self._seek_base_at = time.monotonic()
+            now = time.monotonic()
+            prev = self._last_raw_position
+            jump = prev is not None and (
+                position > prev + SEEK_FORWARD_JUMP
+                or position < prev - SEEK_BACKWARD_JUMP
+            )
+            candidate = self._pending_jump
+            self._pending_jump = None
+            blip = False
+            if candidate is not None:
+                cpos, cat = candidate[0], candidate[2]
+                fresh = now - cat <= SEEK_BASE_MAX_AGE
+                if fresh and not jump and cpos - 1.0 <= position <= cpos + (now - cat) + 1.0:
+                    # the next print continues forward from the jump: confirmed
+                    self.seek_seq += 1
+                elif jump and self._continues_seek_base(position, now):
+                    blip = True  # jitter blip: back on the pre-jump timeline, no bump
+                # else: drop the candidate (expired or unrelated print)
+            if jump and not blip:
+                if candidate is None:
+                    # first jump of a disturbance: arm with the pre-jump
+                    # snapshot — same anchor a confirmed seek gets, and what
+                    # the grace wait compares new-track prints against
+                    self._seek_base = (self._position, self._duration)
+                    self._seek_base_at = self._at
+                self._pending_jump = (position, duration, now)
             self._last_raw_position = position
             self._position = position
             self._duration = duration
-            self._at = time.monotonic()
+            self._at = now
             self.ever = True
 
     def seek_base(self, max_age: float) -> tuple[float, float] | None:
