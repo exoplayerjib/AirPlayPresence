@@ -35,18 +35,20 @@ def fresh_image_url(url: str) -> str:
     return f"{url}?v={next(_image_nonce)}"
 
 
-def read_valid_art(path: Path) -> bytes | None:
+def read_valid_art(path: Path, accept=None) -> bytes | None:
     try:
         data = path.read_bytes()
     except OSError:
         return None
-    return data if valid_art_bytes(data) else None
+    if not valid_art_bytes(data):
+        return None
+    return data if accept is None or accept(data) else None
 
 
-def wait_valid_art(path: Path, timeout: float = ART_SETTLE_TIMEOUT) -> bytes | None:
+def wait_valid_art(path: Path, timeout: float = ART_SETTLE_TIMEOUT, accept=None) -> bytes | None:
     deadline = time.monotonic() + timeout
     while True:
-        data = read_valid_art(path)
+        data = read_valid_art(path, accept)
         if data is not None:
             return data
         if time.monotonic() >= deadline:
@@ -58,6 +60,8 @@ class ImageUploader:
     def __init__(self, enabled: bool):
         self.enabled = enabled
         self._cache: dict[str, tuple[str, float]] = {}
+        # digest -> album (or title) of the track the art was first accepted for
+        self._owners: dict[str, str] = {}
         self._lock = threading.Lock()
         # why the last url_for attempt failed: "no-file" (invalid/missing art
         # file — retryable immediately) or "network" (litterbox refused —
@@ -65,23 +69,31 @@ class ImageUploader:
         self.last_failure_kind: str | None = None
         self.last_http_status: int | None = None
 
-    def url_for(self, path: Path, wait: bool = True) -> str | None:
+    def _accepts(self, data: bytes, owner: str) -> bool:
+        with self._lock:
+            known = self._owners.get(hashlib.sha256(data).hexdigest())
+        return known is None or known == owner
+
+    def url_for(self, path: Path, wait: bool = True, owner: str | None = None) -> str | None:
         if not self.enabled:
             self.last_failure_kind = "disabled"
             return None
-        data = wait_valid_art(path) if wait else read_valid_art(path)
+        accept = None if owner is None else (lambda data: self._accepts(data, owner))
+        data = wait_valid_art(path, accept=accept) if wait else read_valid_art(path, accept=accept)
         if data is None:
             if wait:
                 try:
                     raw = path.read_bytes()
-                    if raw:
+                    if not raw:
+                        log.warning("cover art file %s is empty; retrying at the next heartbeat", path)
+                    elif valid_art_bytes(raw):
+                        log.info("cover art in %s is still the previous track's; retrying at the next heartbeat", path)
+                    else:
                         kind = "placeholder" if len(raw) < 200 else "wrong format"
                         log.warning(
                             "no valid cover art in %s (%d bytes, %s); retrying at the next heartbeat",
                             path, len(raw), kind,
                         )
-                    else:
-                        log.warning("cover art file %s is empty; retrying at the next heartbeat", path)
                 except OSError:
                     log.warning("cover art file %s absent; retrying at the next heartbeat", path)
             self.last_failure_kind = "no-file"
@@ -89,6 +101,9 @@ class ImageUploader:
         self.last_failure_kind = None
         self.last_http_status = None
         digest = hashlib.sha256(data).hexdigest()
+        if owner is not None:
+            with self._lock:
+                self._owners.setdefault(digest, owner)
         with self._lock:
             cached = self._cache.get(digest)
         if cached and time.monotonic() - cached[1] < UPLOAD_TTL:
@@ -256,7 +271,11 @@ class ArtworkResolver:
             return cached[0] if cached and now - cached[1] < UPLOAD_TTL else None
         url = self._lookup_itunes(title, artist) if self.itunes else None
         if not url:
-            url = self.uploader.url_for(image_path, wait=wait)
+            # uxplay keeps the previous track's cover in the -ca file until the
+            # new one arrives; a cover first accepted for another album is
+            # stale and must not be uploaded under this track
+            owner = (meta.get("album") or title).strip().lower()
+            url = self.uploader.url_for(image_path, wait=wait, owner=owner)
         if url:
             with self._lock:
                 self._cache[key] = (url, time.monotonic())

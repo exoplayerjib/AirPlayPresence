@@ -240,6 +240,19 @@ class PresenceBridge:
                 pass
             self._rpc = None
 
+def slot_value(field: str | None, meta: dict) -> str | None:
+    """Resolve one presence slot from the config field mapping."""
+    if not field or field == "none":
+        return None
+    if field == APPLE_MUSIC:
+        value = clip(APPLE_MUSIC_TEXT)
+    elif field.startswith(CUSTOM_PREFIX):
+        value = clip(clean_value(field[len(CUSTOM_PREFIX):]))
+    else:
+        value = clip(meta.get(field))
+    return value or None
+
+
 def build_payload(
     meta: dict,
     image_url: str | None,
@@ -248,19 +261,16 @@ def build_payload(
 ) -> dict:
     payload = {"activity_type": ActivityType.LISTENING}
     for slot in SLOTS:
-        field = mapping.get(slot)
-        if not field or field == "none":
-            continue
-        if field == APPLE_MUSIC:
-            value = clip(APPLE_MUSIC_TEXT)
-        elif field.startswith(CUSTOM_PREFIX):
-            value = clip(clean_value(field[len(CUSTOM_PREFIX):]))
-        else:
-            value = clip(meta.get(field))
+        value = slot_value(mapping.get(slot), meta)
         if value:
             payload[slot] = value
     if image_url:
         payload["large_image"] = image_url
+    else:
+        # an assets block without large_image makes Discord render a grey
+        # "?" tile — with no public art url, send no assets at all (the
+        # hover text returns with the image once art resolves)
+        payload.pop("large_text", None)
     display = mapping.get("status_display")
     if display not in payload:
         display = "name"

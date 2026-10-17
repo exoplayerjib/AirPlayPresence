@@ -15,7 +15,7 @@ from .constants import (
     STATUS_DISPLAY_MAP,
 )
 from .mpris import MprisServer
-from .presence import PresenceBridge, build_payload
+from .presence import PresenceBridge, build_payload, slot_value
 from .state import AppState, ProgressState
 from .utils import parse_metadata
 from .uxplay import new_track_signature
@@ -196,6 +196,11 @@ def run_worker(
             return
         payload = dict(last_payload)
         payload["large_image"] = fresh_image_url(url)
+        # the image-less publish dropped the hover text (assets without
+        # large_image render a "?" tile): restore it alongside the image
+        value = slot_value(config.get().get("large_text"), current_meta)
+        if value:
+            payload["large_text"] = value
         log.info("cover art attached: %s", url)
         bridge.update(payload, throttle=RESUME_THROTTLE, force=True)
         last_payload = payload
@@ -300,6 +305,7 @@ def run_worker(
             and time.monotonic() - debouncer.last_schedule >= HEARTBEAT_QUIET
         ):
             payload = dict(last_payload)
+            mapping = config.get()
             if current_meta is not None:
                 # non-blocking cache lookup: a missing/expired link no longer
                 # uploads inline (that could stall the worker for the whole
@@ -311,10 +317,17 @@ def run_worker(
                         mpris.publish(current_meta, image_url, paused=False)
                 if image_url:
                     payload["large_image"] = fresh_image_url(image_url)
+                    value = slot_value(mapping.get("large_text"), current_meta)
+                    if value:
+                        payload["large_text"] = value
+                    else:
+                        payload.pop("large_text", None)
                 else:
+                    # no public art url: send no assets at all, an assets
+                    # block without large_image renders a "?" tile
                     payload.pop("large_image", None)
+                    payload.pop("large_text", None)
                     art_worker.request(current_meta)
-            mapping = config.get()
             if mapping.get("status_rotation"):
                 order = mapping.get("status_rotation_order") or []
                 nowm = time.monotonic()

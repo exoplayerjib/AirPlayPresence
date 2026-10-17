@@ -58,7 +58,7 @@ h1{font-size:1.3rem;margin:18px 0 4px;overflow-wrap:anywhere}
 <div class="card">
   <div id="idle"><p>Nothing playing</p><p class="sub">Start an AirPlay session to this server.</p></div>
   <div id="now" style="display:none">
-    <img id="art" alt="cover art">
+    <img id="art" alt="cover art" src="data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==" onerror="artFail(this)">
     <p class="paused-label" id="paused">Paused</p>
     <h1 id="title"></h1>
     <p class="artist" id="artist"></p>
@@ -226,6 +226,9 @@ function markLive(line) {
     li.querySelector(".live").textContent = li.dataset.value === line ? "showing" : "";
   });
 }
+const BLANK = "data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==";
+let artState = { key: "", at: 0 };
+function artFail(img) { if (!img.src.startsWith("data:")) img.src = BLANK; }
 async function tick() {
   try {
     const s = await (await fetch("/state")).json();
@@ -235,7 +238,16 @@ async function tick() {
     markLive(visible ? s.status_line : null);
     if (!visible) return;
     el("paused").style.display = s.paused ? "block" : "none";
-    if (el("art").dataset.src !== s.image) { el("art").src = s.image; el("art").dataset.src = s.image; }
+    // art always comes from uxplay's -ca file via the local /art endpoint:
+    // s.image (the upload url) may be dead or blocked while the copy on disk
+    // is fine. s.art fingerprints that file (size+mtime_ns), so a rewrite by
+    // uxplay reloads it immediately; the 5s fallback re-probes while the file
+    // is absent or still the placeholder (stamp stays "" / unchanged then).
+    const artKey = [s.title, s.artist, s.art || ""].join("|");
+    if (artKey !== artState.key || Date.now() - artState.at > 5000) {
+      artState = { key: artKey, at: Date.now() };
+      el("art").src = "/art?t=" + artState.at;
+    }
     el("title").textContent = s.title || "";
     el("artist").textContent = s.artist || "";
     el("album").textContent = s.album || "";
@@ -264,6 +276,15 @@ def make_ui_server(
     config: PresenceConfig,
     on_config_change,
 ) -> ThreadingHTTPServer | None:
+    def art_stamp() -> str:
+        """Fingerprint of the -ca cover file (size+mtime_ns, "" while absent)
+        so the page reloads /art exactly when uxplay rewrites the cover."""
+        try:
+            st = image_path.stat()
+        except OSError:
+            return ""
+        return f"{st.st_size}-{st.st_mtime_ns}"
+
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, format: str, *args) -> None:
             log.debug("ui: " + format, *args)
@@ -277,15 +298,20 @@ def make_ui_server(
             self.wfile.write(body)
 
         def do_GET(self) -> None:
-            if self.path in ("/", "/index.html"):
+            # self.path keeps the query string ("/art?t=..."): match on the
+            # route alone or every cache-busted /art request falls to 404
+            route = self.path.split("?", 1)[0]
+            if route in ("/", "/index.html"):
                 self._send(200, "text/html; charset=utf-8", PAGE.encode())
-            elif self.path == "/state":
-                body = json.dumps(state.snapshot()).encode()
+            elif route == "/state":
+                snap = state.snapshot()
+                snap["art"] = art_stamp()
+                body = json.dumps(snap).encode()
                 self._send(200, "application/json", body)
-            elif self.path == "/config":
+            elif route == "/config":
                 body = json.dumps(config.get()).encode()
                 self._send(200, "application/json", body)
-            elif self.path == "/art":
+            elif route == "/art":
                 try:
                     data = image_path.read_bytes()
                 except OSError:
