@@ -3,6 +3,8 @@ __pycache__/
 *.pyc
 *.egg-info/
 .client-id
+.spotify-client-id
+.spotify-client-secret
 .run/
 dist/
 build/

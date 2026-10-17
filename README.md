@@ -76,7 +76,7 @@ cd AirPlayPresence
 ./run.sh YOUR_APPLICATION_ID
 ```
 
-`run.sh` creates the virtualenv, installs the package (deps come from `pyproject.toml`), stores the token in `.client-id` (repo-local, gitignored, mode 600), and launches the app. Next time just:
+`run.sh` creates the virtualenv, installs the package (deps come from `pyproject.toml`), stores the token in `.client-id` (repo-local, gitignored, mode 600), and launches the app. Spotify credentials work the same way once, then persist: `./run.sh --spotify-id ID --spotify-secret SECRET` stores them in `.spotify-client-id`/`.spotify-client-secret`; after that a plain `./run.sh` picks them up (`SPOTIFY_CLIENT_ID`/`SPOTIFY_CLIENT_SECRET` env still override). Next time just:
 
 ```bash
 ./run.sh                     # uses the stored token
