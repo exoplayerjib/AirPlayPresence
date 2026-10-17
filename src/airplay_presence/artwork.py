@@ -241,6 +241,11 @@ class SpotifyLookup:
         self._token: str | None = None
         self._token_exp = 0.0
         self._lock = threading.Lock()
+        # set to the refusal body when the API denies the search at the
+        # policy level (HTTP 403 — e.g. the app owner lacks the active
+        # Spotify Premium subscription the Web API requires): every later
+        # lookup would fail identically, so the source gives up for the run
+        self._disabled: str | None = None
 
     def _access_token(self) -> str | None:
         with self._lock:
@@ -276,6 +281,8 @@ class SpotifyLookup:
         return token
 
     def lookup(self, title: str, artist: str) -> str | None:
+        if self._disabled:
+            return None
         if not title:
             return None
         token = self._access_token()
@@ -291,6 +298,24 @@ class SpotifyLookup:
         try:
             with urllib.request.urlopen(request, timeout=10) as response:
                 data = json.loads(response.read())
+        except urllib.error.HTTPError as exc:
+            detail = ""
+            try:
+                detail = exc.read(500).decode("utf-8", "replace").strip()
+            except Exception:
+                pass
+            if exc.code == 403:
+                self._disabled = detail or "HTTP 403"
+                log.warning(
+                    "spotify search forbidden (HTTP 403): %s — disabling the spotify fallback for this run",
+                    self._disabled,
+                )
+            else:
+                log.warning(
+                    "spotify search failed: HTTP %s%s",
+                    exc.code, f"; body: {detail!r}" if detail else "",
+                )
+            return None
         except (urllib.error.URLError, OSError, ValueError) as exc:
             log.warning("spotify search failed: %s", exc)
             return None
