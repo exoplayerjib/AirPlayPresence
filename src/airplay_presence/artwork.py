@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import logging
 import hashlib
 import itertools
@@ -16,7 +17,8 @@ import uuid
 from pathlib import Path
 
 from .constants import (
-    MIN_ART_BYTES, ART_SETTLE_TIMEOUT, UPLOAD_EXPIRY, UPLOAD_GATE_EXTENDED_SECONDS,
+    MIN_ART_BYTES, ART_SETTLE_TIMEOUT, SPOTIFY_TOKEN_MARGIN, UPLOAD_EXPIRY,
+    UPLOAD_GATE_EXTENDED_SECONDS,
     UPLOAD_GATE_EXTENDED_STRIKES, UPLOAD_HTTP_FAILURE_BODY_CAPTURE, UPLOAD_HTTP_RETRIES,
     UPLOAD_HTTP_RETRY_BACKOFF, UPLOAD_RETRY, UPLOAD_RETRY_TRANSIENT, UPLOAD_TTL,
     UPLOAD_URL, UPLOAD_USER_AGENT, UPLOAD_VERIFY_TIMEOUT,
@@ -221,6 +223,103 @@ def norm_text(value: str) -> str:
     )
 
 
+class SpotifyLookup:
+    """Fallback art source: Spotify Web API via the client-credentials flow.
+
+    Needs a free Spotify application's client id + secret (no scopes —
+    public catalog search only). The access token is cached until
+    SPOTIFY_TOKEN_MARGIN before it expires; the track match reuses the
+    iTunes rules (normalized title equality + artist-token overlap) and
+    returns the largest album image (640px, i.scdn.co — public CDN)."""
+
+    TOKEN_URL = "https://accounts.spotify.com/api/token"
+    SEARCH_URL = "https://api.spotify.com/v1/search"
+
+    def __init__(self, client_id: str, client_secret: str):
+        self._client_id = client_id
+        self._client_secret = client_secret
+        self._token: str | None = None
+        self._token_exp = 0.0
+        self._lock = threading.Lock()
+
+    def _access_token(self) -> str | None:
+        with self._lock:
+            if self._token and time.monotonic() < self._token_exp:
+                return self._token
+        credentials = base64.b64encode(
+            f"{self._client_id}:{self._client_secret}".encode()
+        ).decode()
+        request = urllib.request.Request(
+            self.TOKEN_URL,
+            data=urllib.parse.urlencode({"grant_type": "client_credentials"}).encode(),
+            headers={
+                "Authorization": f"Basic {credentials}",
+                "Content-Type": "application/x-www-form-urlencoded",
+                "User-Agent": "airplay-presence/1.0",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                data = json.loads(response.read())
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            log.warning("spotify token request failed: %s", exc)
+            return None
+        token = data.get("access_token")
+        if not token:
+            log.warning("spotify token response had no access_token: %r", data)
+            return None
+        expires = max(0.0, float(data.get("expires_in") or 3600) - SPOTIFY_TOKEN_MARGIN)
+        with self._lock:
+            self._token = token
+            self._token_exp = time.monotonic() + expires
+        return token
+
+    def lookup(self, title: str, artist: str) -> str | None:
+        if not title:
+            return None
+        token = self._access_token()
+        if not token:
+            return None
+        params = urllib.parse.urlencode(
+            {"type": "track", "limit": "5", "q": f'track:"{title}" artist:"{artist}"'}
+        )
+        request = urllib.request.Request(
+            f"{self.SEARCH_URL}?{params}",
+            headers={"Authorization": f"Bearer {token}", "User-Agent": "airplay-presence/1.0"},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                data = json.loads(response.read())
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            log.warning("spotify search failed: %s", exc)
+            return None
+        url = self._pick(data, title, artist)
+        if url:
+            log.info("artwork from Spotify: %s", url)
+        else:
+            log.info("no Spotify match for %r, falling back to litterbox upload", title)
+        return url
+
+    @staticmethod
+    def _pick(data: dict, title: str, artist: str) -> str | None:
+        want_title = norm_text(title)
+        artist_tokens = {t for t in re.split(r"\W+", artist.lower()) if len(t) >= 3}
+        for item in data.get("tracks", {}).get("items", []):
+            if norm_text(item.get("name", "")) != want_title:
+                continue
+            names = " ".join(a.get("name", "") for a in item.get("artists", [])).lower()
+            if artist_tokens and not any(tok in names for tok in artist_tokens):
+                continue
+            images = item.get("album", {}).get("images") or []
+            if not images:
+                continue
+            best = max(images, key=lambda im: im.get("width") or 0)
+            if best.get("url"):
+                return best["url"]
+        return None
+
+
 class ArtworkResolver:
     """Resolves cover art per track, preferring iTunes (optional) then uploads.
 
@@ -232,11 +331,16 @@ class ArtworkResolver:
       get the full UPLOAD_RETRY (60s); 5xx flakes and connection errors
       get UPLOAD_RETRY_TRANSIENT (20s). Reaching 3 strikes extends either
       class to the 300s extended cooldown.
+
+    Resolution chain per track: iTunes Search (if enabled) → Spotify Web
+    API (if credentials are configured) → litterbox upload. The first
+    source that returns a URL wins; misses move down the chain.
     """
 
-    def __init__(self, uploader: ImageUploader, itunes: bool = False):
+    def __init__(self, uploader: ImageUploader, itunes: bool = False, spotify: "SpotifyLookup | None" = None):
         self.uploader = uploader
         self.itunes = itunes
+        self.spotify = spotify
         self._cache: dict[tuple[str, str], tuple[str, float]] = {}
         self._lock = threading.Lock()
         self.last_failure_kind: str | None = None
@@ -270,6 +374,8 @@ class ArtworkResolver:
             # no new upload attempts until the cooldown expires
             return cached[0] if cached and now - cached[1] < UPLOAD_TTL else None
         url = self._lookup_itunes(title, artist) if self.itunes else None
+        if not url and self.spotify is not None:
+            url = self.spotify.lookup(title, artist)
         if not url:
             # uxplay keeps the previous track's cover in the -ca file until the
             # new one arrives; a cover first accepted for another album is

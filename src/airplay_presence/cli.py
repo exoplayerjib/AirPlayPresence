@@ -16,6 +16,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--image-file", default="/tmp/uxplay/image.jpeg")
     parser.add_argument("--no-image", action="store_true", help="do not upload cover art")
     parser.add_argument("--itunes-art", action="store_true", help="look up cover art on iTunes before uploading (upload-only by default)")
+    parser.add_argument(
+        "--spotify-client-id",
+        default=os.environ.get("SPOTIFY_CLIENT_ID"),
+        help="Spotify app client ID for the cover-art fallback between iTunes and upload (defaults to $SPOTIFY_CLIENT_ID)",
+    )
+    parser.add_argument(
+        "--spotify-client-secret",
+        default=os.environ.get("SPOTIFY_CLIENT_SECRET"),
+        help="Spotify app client secret for the cover-art fallback (defaults to $SPOTIFY_CLIENT_SECRET)",
+    )
     parser.add_argument("--port", type=int, default=None, help="AirPlay TCP port for uxplay (default: uxplay's legacy port set)")
     parser.add_argument("--name", default="AirPlayPresence", help="AirPlay server name shown on clients (default: AirPlayPresence)")
     parser.add_argument("--ui-port", type=int, default=8080, help="port for the local web UI (default 8080)")

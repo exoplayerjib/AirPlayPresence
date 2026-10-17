@@ -11,7 +11,7 @@ No more "Listening to Spotify" envy. Stream Apple Music to Linux, and Discord fi
 - **Self-contained AirPlay server** — spawns `uxplay` itself as a headless, audio-only receiver (no mirroring window); just pick it from the AirPlay menu on your device.
 - **Discord Rich Presence** — "Listening to Apple Music" with cover art and a live elapsed / remaining timer.
 - **Editable presence lines** — choose what goes on each of the four Discord lines (title / artist / album / album artist / genre / fixed text) and what the member-list badge shows, right from the web UI. Saved across restarts.
-- **Cover art pipeline** — the validated cover file is uploaded to litterbox.catbox.moe (1-hour links); pass `--itunes-art` to try the iTunes CDN first.
+- **Cover art pipeline** — the validated cover file is uploaded to litterbox.catbox.moe (1-hour links); pass `--itunes-art` to try the iTunes CDN first. With Spotify app credentials (`--spotify-client-id`/`--spotify-client-secret` or `$SPOTIFY_CLIENT_ID`/`$SPOTIFY_CLIENT_SECRET`), tracks the iTunes Search misses fall back to a Spotify catalog lookup (client-credentials token, cached ~1h) before the upload.
 - **MPRIS media player** — shows up in GNOME/KDE media controls and `playerctl` with title, artist, album, art, and position.
 - **Honest pause handling** — pausing or ending the stream clears the presence; resuming restores it automatically.
 - **Local web page** — cover art, track info, and a progress bar at `http://127.0.0.1:8080`.
@@ -144,6 +144,8 @@ Changes apply live and are saved to `~/.config/airplay-presence/config.json`.
 | `--no-mpris` | — | Disable the D-Bus media player |
 | `--no-image` | — | Disable cover-art upload |
 | `--itunes-art` | — | Look up cover art on iTunes before uploading (upload-only by default) |
+| `--spotify-client-id` / `$SPOTIFY_CLIENT_ID` | — | Spotify app client ID; enables the Spotify cover-art fallback (needs `--spotify-client-secret` too) |
+| `--spotify-client-secret` / `$SPOTIFY_CLIENT_SECRET` | — | Spotify app client secret |
 | `--meta-file` / `--image-file` | `/tmp/uxplay/…` | uxplay output file paths |
 | `--config PATH` | `~/.config/airplay-presence/config.json` | Presence-lines config |
 | `--min-interval S` | 5 | Minimum seconds between Discord updates; the presence is also re-sent at this cadence even when unchanged |
@@ -185,7 +187,7 @@ journalctl --user -u airplaypresence.service -f
 - **Server doesn't appear on the phone** — check the firewall section above; verify mDNS is running (`systemctl status avahi-daemon`).
 - **Connects but no sound** — missing GStreamer audio plugins; install `gstreamer1.0-libav` and the plugin for your audio server (PipeWire/Pulse/ALSA).
 - **No countdown timer in Discord** — progress data only exists for **audio-only (ALAC)** streaming, which is how Apple Music streams by default. Screen-mirroring (AAC) provides none — the presence still shows track info, just without times.
-- **Cover art missing** — a valid cover file is uploaded to litterbox.catbox.moe (1-hour links; once a link expires, the next update uploads a fresh one), which needs internet access; pass `--itunes-art` to try the iTunes CDN first. Invalid/placeholder images are never uploaded immediately — the file is polled briefly, then retried at every heartbeat until valid. Genuine server-side failures (litterbox refusing, CDN lag) open a 60-second cooldown so your IP isn't hammered; after three consecutive failures the cooldown extends to 5 minutes until the next success, and the rejection status plus response body are logged, so the TUI/log tells you whether it's an outage (retry until it passes) or an IP rate-limit (~1h, wait it out). If Discord's first fetch of a link fails, the link is varied on every update so Discord re-fetches instead of pinning a broken placeholder.
+- **Cover art missing** — a valid cover file is uploaded to litterbox.catbox.moe (1-hour links; once a link expires, the next update uploads a fresh one), which needs internet access; pass `--itunes-art` to try the iTunes CDN first. Invalid/placeholder images are never uploaded immediately — the file is polled briefly, then retried at every heartbeat until valid. Genuine server-side failures (litterbox refusing, CDN lag) open a 60-second cooldown so your IP isn't hammered; after three consecutive failures the cooldown extends to 5 minutes until the next success, and the rejection status plus response body are logged, so the TUI/log tells you whether it's an outage (retry until it passes) or an IP rate-limit (~1h, wait it out). If Discord's first fetch of a link fails, the link is varied on every update so Discord re-fetches instead of pinning a broken placeholder. With Spotify credentials set (`--spotify-client-id`/`--spotify-client-secret` or `$SPOTIFY_CLIENT_ID`/`$SPOTIFY_CLIENT_SECRET`), songs the iTunes Search doesn't know fall back to a Spotify catalog lookup (client-credentials token cached until a minute before expiry) before the upload step.
 - **Presence stops updating** — the Discord desktop app must be running on the same machine; sends are rate-limited to stay within Discord's limits (deferred sends are logged).
 
 ## Limitations

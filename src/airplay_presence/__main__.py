@@ -14,7 +14,7 @@ from pathlib import Path
 from watchdog.observers import Observer
 
 from .ringlog import RingBufferHandler
-from .artwork import ArtWorker, ArtworkResolver, ImageUploader
+from .artwork import ArtWorker, ArtworkResolver, ImageUploader, SpotifyLookup
 from .cli import parse_args
 from .config import PresenceConfig
 from .mpris import MPRIS_AVAILABLE, MprisServer
@@ -120,7 +120,17 @@ def main() -> int:
     failed = threading.Event()
     crashed = threading.Event()
     debouncer = Debouncer(args.debounce, jobs.put)
-    artwork = ArtworkResolver(ImageUploader(not args.no_image), itunes=args.itunes_art)
+    spotify = None
+    if args.spotify_client_id and args.spotify_client_secret:
+        spotify = SpotifyLookup(args.spotify_client_id, args.spotify_client_secret)
+        log.info("spotify cover-art fallback enabled")
+    elif args.spotify_client_id or args.spotify_client_secret:
+        log.warning(
+            "spotify fallback needs both a client id and a client secret; disabled"
+        )
+    artwork = ArtworkResolver(
+        ImageUploader(not args.no_image), itunes=args.itunes_art, spotify=spotify
+    )
     art_worker = ArtWorker(artwork, image_path, jobs.put, stop_event)
 
     ui_server = None
