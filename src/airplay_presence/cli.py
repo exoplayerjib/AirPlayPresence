@@ -17,6 +17,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-image", action="store_true", help="do not upload cover art")
     parser.add_argument("--itunes-art", action="store_true", help="look up cover art on iTunes before uploading (upload-only by default)")
     parser.add_argument(
+        "--deezer-art",
+        action="store_true",
+        help="also look up cover art on Deezer (keyless, no account) when iTunes/Spotify have no match",
+    )
+    parser.add_argument(
         "--spotify-client-id",
         default=os.environ.get("SPOTIFY_CLIENT_ID"),
         help="Spotify app client ID for the cover-art fallback between iTunes and upload (defaults to $SPOTIFY_CLIENT_ID)",

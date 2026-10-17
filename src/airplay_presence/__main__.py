@@ -14,7 +14,7 @@ from pathlib import Path
 from watchdog.observers import Observer
 
 from .ringlog import RingBufferHandler
-from .artwork import ArtWorker, ArtworkResolver, ImageUploader, SpotifyLookup
+from .artwork import ArtWorker, ArtworkResolver, DeezerLookup, ImageUploader, SpotifyLookup
 from .cli import parse_args
 from .config import PresenceConfig
 from .mpris import MPRIS_AVAILABLE, MprisServer
@@ -129,7 +129,10 @@ def main() -> int:
             "spotify fallback needs both a client id and a client secret; disabled"
         )
     artwork = ArtworkResolver(
-        ImageUploader(not args.no_image), itunes=args.itunes_art, spotify=spotify
+        ImageUploader(not args.no_image),
+        itunes=args.itunes_art,
+        spotify=spotify,
+        deezer=DeezerLookup() if args.deezer_art else None,
     )
     art_worker = ArtWorker(artwork, image_path, jobs.put, stop_event)
 

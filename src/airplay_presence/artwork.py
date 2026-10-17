@@ -17,8 +17,8 @@ import uuid
 from pathlib import Path
 
 from .constants import (
-    MIN_ART_BYTES, ART_SETTLE_TIMEOUT, SPOTIFY_TOKEN_MARGIN, UPLOAD_EXPIRY,
-    UPLOAD_GATE_EXTENDED_SECONDS,
+    DEEZER_SEARCH_URL, MIN_ART_BYTES, ART_SETTLE_TIMEOUT, SPOTIFY_TOKEN_MARGIN,
+    UPLOAD_EXPIRY, UPLOAD_GATE_EXTENDED_SECONDS,
     UPLOAD_GATE_EXTENDED_STRIKES, UPLOAD_HTTP_FAILURE_BODY_CAPTURE, UPLOAD_HTTP_RETRIES,
     UPLOAD_HTTP_RETRY_BACKOFF, UPLOAD_RETRY, UPLOAD_RETRY_TRANSIENT, UPLOAD_TTL,
     UPLOAD_URL, UPLOAD_USER_AGENT, UPLOAD_VERIFY_TIMEOUT,
@@ -345,6 +345,63 @@ class SpotifyLookup:
         return None
 
 
+class DeezerLookup:
+    """Fallback art source: Deezer's public search API (keyless, no account).
+
+    One GET per lookup; returns the best album cover for the track
+    (cover_xl is 1000x1000 on e-cdns-images.dzcdn.net, a public CDN).
+    Deezer's artist:"..."/track:"..." field filters return nothing, so
+    the query is plain terms; matching reuses the iTunes rules with one
+    relaxation — the normalized title may be a PREFIX of the result's
+    (Deezer titles carry suffixes like "(from GTAVI: The Album)").
+    Artist-token overlap still guards against cover versions."""
+
+    SEARCH_URL = DEEZER_SEARCH_URL
+
+    def lookup(self, title: str, artist: str) -> str | None:
+        if not title:
+            return None
+        params = urllib.parse.urlencode({"limit": "5", "q": f"{artist} {title}".strip()})
+        request = urllib.request.Request(
+            f"{self.SEARCH_URL}?{params}",
+            headers={"User-Agent": "airplay-presence/1.0"},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                data = json.loads(response.read())
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            log.warning("deezer search failed: %s", exc)
+            return None
+        # deezer reports quota/rate problems as HTTP 200 + an error object
+        if data.get("error"):
+            log.warning("deezer search error: %r", data["error"])
+            return None
+        url = self._pick(data, title, artist)
+        if url:
+            log.info("artwork from Deezer: %s", url)
+        else:
+            log.info("no Deezer match for %r, falling back to litterbox upload", title)
+        return url
+
+    @staticmethod
+    def _pick(data: dict, title: str, artist: str) -> str | None:
+        want_title = norm_text(title)
+        artist_tokens = {t for t in re.split(r"\W+", artist.lower()) if len(t) >= 3}
+        for item in data.get("data") or []:
+            got_title = norm_text(item.get("title", ""))
+            if got_title != want_title and not got_title.startswith(want_title):
+                continue
+            artist_name = (item.get("artist") or {}).get("name", "").lower()
+            if artist_tokens and not any(tok in artist_name for tok in artist_tokens):
+                continue
+            album = item.get("album") or {}
+            for key in ("cover_xl", "cover_big", "cover_medium"):
+                url = album.get(key)
+                if url:
+                    return url
+        return None
+
+
 class ArtworkResolver:
     """Resolves cover art per track, preferring iTunes (optional) then uploads.
 
@@ -358,14 +415,22 @@ class ArtworkResolver:
       class to the 300s extended cooldown.
 
     Resolution chain per track: iTunes Search (if enabled) → Spotify Web
-    API (if credentials are configured) → litterbox upload. The first
-    source that returns a URL wins; misses move down the chain.
+    API (if credentials are configured) → Deezer public search (if
+    enabled) → litterbox upload. The first source that returns a URL
+    wins; misses move down the chain.
     """
 
-    def __init__(self, uploader: ImageUploader, itunes: bool = False, spotify: "SpotifyLookup | None" = None):
+    def __init__(
+        self,
+        uploader: ImageUploader,
+        itunes: bool = False,
+        spotify: "SpotifyLookup | None" = None,
+        deezer: "DeezerLookup | None" = None,
+    ):
         self.uploader = uploader
         self.itunes = itunes
         self.spotify = spotify
+        self.deezer = deezer
         self._cache: dict[tuple[str, str], tuple[str, float]] = {}
         self._lock = threading.Lock()
         self.last_failure_kind: str | None = None
@@ -401,6 +466,8 @@ class ArtworkResolver:
         url = self._lookup_itunes(title, artist) if self.itunes else None
         if not url and self.spotify is not None:
             url = self.spotify.lookup(title, artist)
+        if not url and self.deezer is not None:
+            url = self.deezer.lookup(title, artist)
         if not url:
             # uxplay keeps the previous track's cover in the -ca file until the
             # new one arrives; a cover first accepted for another album is
