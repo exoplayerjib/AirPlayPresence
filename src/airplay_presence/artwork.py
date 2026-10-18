@@ -352,9 +352,11 @@ class DeezerLookup:
     (cover_xl is 1000x1000 on e-cdns-images.dzcdn.net, a public CDN).
     Deezer's artist:"..."/track:"..." field filters return nothing, so
     the query is plain terms; matching reuses the iTunes rules with one
-    relaxation — the normalized title may be a PREFIX of the result's
-    (Deezer titles carry suffixes like "(from GTAVI: The Album)").
-    Artist-token overlap still guards against cover versions."""
+    relaxation — normalized titles may be prefixes of each other in
+    EITHER direction: Deezer titles carry suffixes like "(from GTAVI:
+    The Album)", and ours do too ("Break Free (feat. Zedd)" matches
+    Deezer's plain "Break Free"). Artist-token overlap still guards
+    against cover versions."""
 
     SEARCH_URL = DEEZER_SEARCH_URL
 
@@ -389,7 +391,9 @@ class DeezerLookup:
         artist_tokens = {t for t in re.split(r"\W+", artist.lower()) if len(t) >= 3}
         for item in data.get("data") or []:
             got_title = norm_text(item.get("title", ""))
-            if got_title != want_title and not got_title.startswith(want_title):
+            if not got_title or not (
+                got_title.startswith(want_title) or want_title.startswith(got_title)
+            ):
                 continue
             artist_name = (item.get("artist") or {}).get("name", "").lower()
             if artist_tokens and not any(tok in artist_name for tok in artist_tokens):
